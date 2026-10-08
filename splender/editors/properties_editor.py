@@ -785,14 +785,32 @@ class MeshMapsPanel(_Panel):
                 layout.label("模型的形状改过，重新烘焙才能对上", icon="warning")
         else:
             layout.label("还没有烘焙。生成器蒙版和智能材质靠它们决定盖住哪里", role="dim")
-        layout.prop(settings, "high_poly")
-        if settings.high_poly:
+        layout.prop(settings, "high_poly_object")
+        scene_high = str(settings.high_poly_object or "0") != "0"
+        col = layout.column()
+        col.enabled = not scene_high
+        col.prop(settings, "high_poly")
+        if settings.high_poly or scene_high:
             layout.prop(settings, "cage_front", slider=True)
             layout.prop(settings, "cage_back", slider=True)
             layout.prop(settings, "normal_samples")
         layout.prop(settings, "normal_format")
         layout.prop(settings, "id_source")
         layout.prop(settings, "resolution")
+        layout.prop(settings, "smooth_resolution")
+        from ..bake.baker import estimate_vram_mb
+
+        need = estimate_vram_mb(int(settings.resolution), int(settings.smooth_resolution))
+        free = 0
+        if engine is not None:
+            from ..engine import glx
+
+            free = glx.vram_info_mb()[1] or 0
+        row = layout.row(heading="约占显存")
+        if free and need > free:
+            row.label("%.1f GB，比现在空闲的 %.1f GB 多，烘焙会很慢" % (need / 1024.0, free / 1024.0), role="warn")
+        else:
+            row.label("%.1f GB" % (need / 1024.0) + ("（空闲 %.1f GB）" % (free / 1024.0) if free else ""), role="dim")
         layout.prop(settings, "ao_samples")
         layout.prop(settings, "ao_distance", slider=True)
         layout.prop(settings, "bake_thickness")
@@ -847,9 +865,14 @@ class ExportPanel(_Panel):
         col.prop(settings, "normal_bake")
         col.prop(settings, "normal_strength", slider=True)
         col.prop(settings, "normal_depth")
+        layout.prop(settings, "with_mesh")
+        col = layout.column()
+        col.enabled = settings.with_mesh
+        col.prop(settings, "mesh_format")
         col = layout.column()
         col.use_property_split = False
         col.operator("wm.export_textures", text="导出贴图…", icon="export", role="primary")
+        col.operator("wm.export_mesh", text="导出模型…", icon="export")
 
 
 # ====================================================================== 工程

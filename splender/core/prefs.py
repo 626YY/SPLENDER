@@ -19,6 +19,8 @@ class InterfacePrefs(PropertyGroup):
     status_hints = BoolProperty("状态栏操作提示", default=True, description="在底部显示当前工具的按键说明")
     load_ui = BoolProperty("打开工程时载入界面布局", default=False,
                            description="打开时使用工程里保存的窗口布局")
+    error_dialog = BoolProperty("出错时弹出提示", default=True,
+                                description="程序内部出错时弹一个窗口说明，能复制诊断信息；关掉后只在状态栏和日志里提示")
 
 
 class NavigationPrefs(PropertyGroup):
@@ -88,7 +90,10 @@ class PaintPrefs(PropertyGroup):
     prefetch_radius = FloatProperty("悬停预取范围", default=2.5, min=1.0, max=8.0, precision=1,
                                     description="鼠标悬停时提前准备笔刷周围多大范围的页面，单位是笔刷半径")
     tablet_api = EnumProperty("数位板接口", items=[
-        ("AUTO", "自动", ""), ("WINTAB", "WinTab", ""), ("WININK", "Windows Ink", "")], default="AUTO")
+        ("AUTO", "自动", "有 Windows Ink 的笔事件就用它；驱动里关了 Windows Ink 时从 WinTab 取压感"),
+        ("WINTAB", "WinTab", "压感、倾斜一律从 WinTab 取（老驱动、关了 Windows Ink 的时候用）"),
+        ("WININK", "Windows Ink", "只用系统的笔事件，不开 WinTab")], default="AUTO",
+        description="压感从哪里来。画画没有压感时换一个试试")
     pressure_curve = FloatProperty("压感曲线", default=1.0, min=0.2, max=5.0, precision=2,
                                    description="小于 1 更敏感，大于 1 更迟钝")
     stroke_dilate = BoolProperty("绘制时向 UV 岛外扩边", default=True,
@@ -144,6 +149,24 @@ class FilePrefs(PropertyGroup):
     recent_count = IntProperty("最近工程数量", default=12, min=0, max=50)
     save_layout_in_project = BoolProperty("把界面布局存进工程", default=True)
     export_dir = StringProperty("默认导出目录", default="", subtype="DIR_PATH")
+    autosave = BoolProperty("自动保存", default=True,
+                            description="每隔一段时间把没保存的改动另存一份；程序意外退出后，下次启动时可以恢复")
+    autosave_minutes = FloatProperty("自动保存间隔", default=2.0, min=0.25, max=120.0, step=0.25, precision=2,
+                                     unit="min", description="距上次自动保存（或手动保存）多久后再存一次")
+    autosave_idle = FloatProperty("等停手", default=1.0, min=0.0, max=30.0, unit="s", precision=1,
+                                  description="到时间后等你停止操作这么久再开始存，不打断正在画的笔划")
+    autosave_max_wait = FloatProperty("最多推迟", default=60.0, min=0.0, max=1800.0, unit="s", precision=0,
+                                      description="一直没停手时最多推迟这么久就照常保存（正在画的那一笔仍会等它画完）")
+    autosave_budget_ms = FloatProperty("每帧最多花", default=1.5, min=0.2, max=20.0, unit="ms", precision=1,
+                                       description="自动保存在每一帧里最多占用的时间。越小越不影响操作，存完需要的时间越长")
+    autosave_threads = IntProperty("压缩线程数", default=2, min=1, max=32,
+                                   description="自动保存压缩数据用几个线程。多了存得快，但会和绘制抢处理器")
+    autosave_dir = StringProperty("自动保存目录", default="", subtype="DIR_PATH",
+                                  description="恢复文件放在哪；空着就放在用户设置目录的 autosave 文件夹里")
+    autosave_keep = IntProperty("最多保留几份", default=5, min=1, max=100,
+                                description="意外退出留下、还没处理的自动保存最多留几份，多了删掉最早的")
+    restore_dir = StringProperty("恢复到", default="", subtype="DIR_PATH",
+                                 description="恢复出来的工程放在哪；空着就放在原工程旁边（没存过的工程放在文档文件夹）")
 
 
 class Preferences(PropertyGroup):

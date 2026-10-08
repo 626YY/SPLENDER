@@ -37,8 +37,26 @@ def main(argv: list[str] | None = None) -> int:
         return 0 if report["ok"] else 2
     if "--selftest" in args:
         isolate_selftest_user_dir()
+    configure_numba_cache()
     from .app import run
     return run(args)
+
+
+def configure_numba_cache() -> None:
+    """numba 编译好的函数存在用户设置目录里（默认存在源码旁边：程序装在只读目录时存不进去，每次启动都要重新编译）。
+    要在第一次 import numba 之前设好。外面已经指定了就不动。"""
+    import os
+
+    if os.environ.get("NUMBA_CACHE_DIR"):
+        return
+    try:
+        from .paths import user_dir
+
+        path = user_dir() / "numba-cache"
+        path.mkdir(parents=True, exist_ok=True)
+        os.environ["NUMBA_CACHE_DIR"] = str(path)
+    except OSError:
+        pass
 
 
 def isolate_selftest_user_dir() -> None:
@@ -48,6 +66,16 @@ def isolate_selftest_user_dir() -> None:
 
     if not os.environ.get("SPLENDER_USER_DIR"):
         os.environ["SPLENDER_USER_DIR"] = tempfile.mkdtemp(prefix="splender_selftest_")
+    if not os.environ.get("NUMBA_CACHE_DIR"):
+        # 临时设置目录每次都是新的：编译缓存放在源码目录的 .cache 里，自检不用每次重新编译
+        from pathlib import Path
+
+        cache = Path(__file__).resolve().parents[1] / ".cache" / "numba"
+        try:
+            cache.mkdir(parents=True, exist_ok=True)
+            os.environ["NUMBA_CACHE_DIR"] = str(cache)
+        except OSError:
+            pass
 
 
 if __name__ == "__main__":

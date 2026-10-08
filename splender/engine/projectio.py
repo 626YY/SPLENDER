@@ -260,6 +260,7 @@ EXPORT_CHANNELS = {
     "roughness": (1, (1,), 8),
     "height": (2, (0,), 16),
     "ao": (1, (2,), 8),
+    "orm": (1, (2, 1, 0), 8),         # 打包：R 环境遮蔽、G 粗糙度、B 金属度（glTF、Unreal 的用法）
 }
 
 
@@ -334,9 +335,9 @@ def export_channel(engine, ts: TextureSet, channel: str, path: str, progress=Non
     """把一个通道导出成 PNG。逐行合成、逐行写出，不把整张图放进内存。"""
     from .export_png import PngStreamWriter
 
-    if channel == "normal":
+    if channel in ("normal", "normal_gl"):            # normal_gl：一律 OpenGL 格式（glTF 用）
         from .export_normal import export_normal
-        return export_normal(engine, ts, path, progress, size)
+        return export_normal(engine, ts, path, progress, size, opengl=channel == "normal_gl")
     started = time.perf_counter()
     state = engine.sets[ts.uid]
     display = state.display
@@ -354,7 +355,7 @@ def export_channel(engine, ts: TextureSet, channel: str, path: str, progress=Non
     fbo = ctx.framebuffer([strip_color, strip_mrao, strip_height])
     writer = PngStreamWriter(path, size, size, len(comps), bit_depth=depth)
     try:
-        engine._prepare_composite(state, with_stroke=False, ao_mix=1.0 if channel == "ao" else None)
+        engine._prepare_composite(state, with_stroke=False, ao_mix=1.0 if channel in ("ao", "orm") else None)
         for row in range(grid - 1, -1, -1):           # 图片第一行对应 v=1
             compose_row(engine, state, level, row, grid, fbo, width, srgb_encode=(channel == "basecolor"))
             if target == 2:

@@ -101,5 +101,92 @@ class KeymapTest(unittest.TestCase):
             self.assertEqual(have.get(key), op, key)
 
 
+
+
+class KeymapOverridesTest(unittest.TestCase):
+    """改键：只存和出厂不一样的；换一份新建的键位表照样用得上；出厂键位以后增删、换顺序也认得出；恢复；冲突。"""
+
+    def pick(self, kc, count=20):
+        """挑 count 条可以改的键位（键盘键、在不同的表里）。"""
+        from splender.core.keymap import snapshot_defaults
+        snapshot_defaults(kc)
+        picked = []
+        for name, km in kc.keymaps.items():
+            for item in km.items:
+                if item.type.endswith("MOUSE") or item.value != "PRESS" or ops.get(item.op) is None:
+                    continue
+                picked.append((name, item))
+                break
+            if len(picked) >= count:
+                break
+        for name, km in kc.keymaps.items():                       # 不够就从大表里再拿
+            for item in km.items:
+                if len(picked) >= count:
+                    break
+                if (name, item) not in picked and not item.type.endswith("MOUSE") and item.value == "PRESS":
+                    picked.append((name, item))
+        return picked[:count]
+
+    def test_twenty_changes_survive_a_fresh_keyconfig(self):
+        import json
+
+        from splender.core.keymap import apply_overrides, is_modified, overrides_from
+        from splender.ui.keymap_editor import set_keys
+
+        kc = default_keyconfig()
+        picked = self.pick(kc)
+        self.assertEqual(len(picked), 20)
+        keys = ["F%d" % n for n in range(1, 13)] + list("QWERTYUI")
+        for (name, item), key in zip(picked, keys):
+            set_keys(item, key, ctrl=True, shift=True, alt=True)
+        picked[0][1].active = False
+        data = json.loads(json.dumps(overrides_from(kc)))
+        self.assertEqual(len(data["changes"]), 20, "只存改过的")
+        fresh = default_keyconfig()
+        applied, missing = apply_overrides(fresh, data)
+        self.assertEqual((applied, missing), (20, 0))
+        changed = [(name, item) for name, km in fresh.keymaps.items() for item in km.items if is_modified(item)]
+        self.assertEqual(len(changed), 20)
+        for (name, item), (fname, fitem) in zip(sorted(picked, key=lambda p: (p[0], p[1].op)),
+                                                 sorted(changed, key=lambda p: (p[0], p[1].op))):
+            self.assertEqual((name, item.op, item.type, item.ctrl, item.shift, item.alt, item.active),
+                             (fname, fitem.op, fitem.type, fitem.ctrl, fitem.shift, fitem.alt, fitem.active))
+        # 再用一次结果一样（可以重复调用）
+        self.assertEqual(apply_overrides(fresh, data), (20, 0))
+
+    def test_identity_survives_new_defaults(self):
+        from splender.core.keymap import apply_overrides, overrides_from
+        from splender.ui.keymap_editor import set_keys
+
+        kc = default_keyconfig()
+        name, item = self.pick(kc, 1)[0]
+        set_keys(item, "F9", ctrl=True)
+        data = overrides_from(kc)
+        newer = default_keyconfig()
+        newer.keymaps[name].items.insert(0, type(item)("wm.search", "F3"))   # 以后的版本在前面加了一条
+        self.assertEqual(apply_overrides(newer, data), (1, 0))
+        found = [i for i in newer.keymaps[name].items if i.op == item.op and i.props == item.props and i.type == "F9"]
+        self.assertEqual(len(found), 1)
+
+    def test_reset_and_conflicts(self):
+        from splender.core.keymap import conflicts, is_modified, reset_all, reset_item, snapshot_defaults
+        from splender.ui.keymap_editor import set_keys
+
+        kc = default_keyconfig()
+        snapshot_defaults(kc)
+        window = kc.keymaps["Window"]
+        save = next(i for i in window.items if i.op == "wm.save")
+        open_ = next(i for i in window.items if i.op == "wm.open")
+        set_keys(open_, save.type, save.ctrl, save.shift, save.alt)        # 打开也用 Ctrl+S
+        found = conflicts(kc, "Window", open_)
+        self.assertIn(("Window", save), found)
+        reset_item(open_)
+        self.assertFalse(is_modified(open_))
+        self.assertNotIn(("Window", save), conflicts(kc, "Window", open_))
+        set_keys(open_, "F2")
+        reset_all(kc)
+        self.assertFalse(any(is_modified(i) for km in kc.keymaps.values() for i in km.items))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

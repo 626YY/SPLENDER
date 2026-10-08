@@ -119,7 +119,7 @@ def build_scene(engine, project, camera, settings: RenderSettings, shading, aspe
                                   height_scale=0.05 * radius_of_set.get(ts.uid, 1.0) * float(ts.height_scale))
         maps = engine.meshmap(ts.uid) if hasattr(engine, "meshmap") else None
         if maps is not None and maps.has_normal:
-            material.normal_tex = RenderTexture(np.ascontiguousarray(maps.read_arrays()["t"][:, :, :3]))
+            material.normal_tex = RenderTexture(np.ascontiguousarray(maps.read_array("t")[:, :, :3]))
         material_of_set[ts.uid] = len(scene.materials)
         scene.materials.append(material)
     if not scene.materials:

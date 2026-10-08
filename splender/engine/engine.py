@@ -368,6 +368,9 @@ class Engine:
 
     # ================================================================== 文档
     def set_project(self, project: Project | None) -> None:
+        saver = self.__dict__.get("_autosave")
+        if saver is not None:
+            saver.reset()                    # 换工程：上一个工程的恢复文件作废
         self._clear_scene()
         self.project = project
         if project is None:
@@ -1989,7 +1992,8 @@ class Engine:
     def frame(self) -> list[View]:
         """推进一帧。返回这一帧重新渲染过的视口。"""
         started = time.perf_counter()
-        self.frame_index += 1
+        # 和页面缓存的帧号对齐（同步的大操作会让缓存的帧号先往前走），两边一起只往前
+        self.frame_index = max(self.frame_index + 1, self.cache.frame + 1)
         self._pending_work = False
         # 1. 要等显卡结果的读取放在最前面：这时显卡上还没有本帧的新工作，几乎不用等
         for view in self.views:
@@ -2049,6 +2053,13 @@ class Engine:
         # 5. 保持显存空闲水位、后台备份：都会让显卡读回，排在本帧渲染之后
         idle = self.stroke is None and not self.merges and self.frame_index - self._last_render > 5
         self.cache.maintain(idle)
+        # 6. 自动保存：笔划进行中不动（写盘线程也暂停），别的时候每帧花一点时间取页面数据交给写盘线程
+        saver = self.__dict__.get("_autosave")
+        if saver is not None and saver.job is not None:
+            stroking = self.stroke is not None or (self.sculpt is not None and self.sculpt.stroke is not None)
+            saver.set_paused(stroking)
+            if not stroking:
+                saver.pump(self.autosave_budget_ms)
         glx.flush()
         now = time.perf_counter()
         self.perf.frame_ms.append((now - started) * 1000.0)
@@ -2198,6 +2209,9 @@ class Engine:
     def needs_frame(self) -> bool:
         if self._pending_work or self.cache.busy or self.merges or self.bake is not None:
             return True
+        saver = self.__dict__.get("_autosave")
+        if saver is not None and saver.job is not None:
+            return True
         if self.stroke is not None and (self.stroke.samples or self.stroke.ended):
             return True
         if any(view.dirty or view.feedback_pending for view in self.views):
@@ -2303,7 +2317,31 @@ class Engine:
         return max_frames
 
     # ================================================================== 存取与导出
+    @property
+    def autosave(self):
+        """自动保存（第一次用到时建）。"""
+        saver = self.__dict__.get("_autosave")
+        if saver is None:
+            from .autosave import Autosaver
+
+            saver = self._autosave = Autosaver(self)
+        return saver
+
+    @property
+    def autosave_budget_ms(self) -> float:
+        files = getattr(self.prefs, "files", None)
+        return float(getattr(files, "autosave_budget_ms", 1.5))
+
     def save_project(self, path: str, extra: dict | None = None, progress=None) -> dict:
+        saver = self.__dict__.get("_autosave")
+        if saver is not None:
+            saver.cancel()
+        info = self._save_project(path, extra, progress)
+        if saver is not None:
+            saver.reset()                    # 工程文件已经是最新的：恢复文件作废
+        return info
+
+    def _save_project(self, path: str, extra: dict | None = None, progress=None) -> dict:
         from .projectio import save_project
         self.complete_strokes(include_active=True)
         if self.sculpt is not None:
@@ -2370,6 +2408,9 @@ class Engine:
         return info
 
     def release(self) -> None:
+        saver = self.__dict__.pop("_autosave", None)
+        if saver is not None:
+            saver.shutdown()
         self._clear_scene()
         for view in list(self.views):
             view.release()
@@ -2380,6 +2421,8 @@ class Engine:
         self.renderer.release()
         self.compositor.release()
         for program in self.__dict__.get("filter_programs", {}).values():
+            program.release()
+        for program in self.__dict__.get("bake_programs", {}).values():
             program.release()
         for texture in self.__dict__.get("filter_temps", {}).values():
             texture.release()

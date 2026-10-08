@@ -34,6 +34,13 @@ def log_dir() -> Path:
     return path
 
 
+def autosave_dir(custom: str = "") -> Path:
+    """自动保存（恢复文件、会话锁）放哪：给了就用给的，否则是用户设置目录里的 autosave。"""
+    path = Path(custom) if custom else user_dir() / "autosave"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
 def scratch_dir() -> Path:
     path = user_dir() / "scratch"
     path.mkdir(parents=True, exist_ok=True)

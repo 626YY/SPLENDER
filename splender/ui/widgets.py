@@ -2970,7 +2970,7 @@ class Separator(QWidget):
 
 
 class Label(QWidget):
-    """文字标签。role：None 正文、"dim" 次要、"faint" 更淡的小字、"title" 小标题。
+    """文字标签。role：None 正文、"dim" 次要、"faint" 更淡的小字、"title" 小标题、"warn" 提醒（橙色）。
 
     默认单行，放不下时末尾省略并在悬停提示里给出全文；setWordWrap(True) 后自动换行。
     """
@@ -3043,6 +3043,8 @@ class Label(QWidget):
             return theme.qcolor("text.dim")
         if self._role == "faint":
             return theme.qcolor("text.faint")
+        if self._role == "warn":
+            return theme.qcolor("warn")
         return theme.qcolor("text")
 
     def _icon_part(self) -> float:

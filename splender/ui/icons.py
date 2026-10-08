@@ -45,6 +45,7 @@ ALIASES = {
     "chevron.up": "chevron-up", "chevron.left": "chevron-left", "maximize": "maximize-2", "restore": "minimize-2",
     "split.h": "columns-2", "split.v": "rows-2", "popout": "external-link", "grip": "grip-vertical",
     "symmetry": "flip-horizontal-2", "environment": "sun", "camera": "camera", "info": "info",
+    "recover": "history", "diagnostics": "copy",
     "warning": "triangle-alert", "error": "circle-alert", "help": "circle-help", "keyboard": "keyboard",
     "memory": "memory-stick", "gpu": "cpu", "disk": "hard-drive", "performance": "zap", "palette": "palette",
     "pin": "pin", "link": "link", "reset": "rotate-ccw", "home": "house", "grid": "grid-3x3", "list": "list",

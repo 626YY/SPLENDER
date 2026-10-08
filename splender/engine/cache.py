@@ -38,7 +38,7 @@ class Page:
     """一页数据。slot>=0 表示在显存；blob 是内存副本；scratch 是暂存文件里的副本；disk_key 表示工程文件里有这页。"""
 
     __slots__ = ("fmt", "slot", "blob", "codec", "disk_key", "scratch", "dirty", "home", "home_x", "home_y", "busy",
-                 "dead", "want")
+                 "dead", "want", "asave")
 
     def __init__(self, fmt: str) -> None:
         self.fmt = fmt
@@ -54,6 +54,7 @@ class Page:
         self.busy = False            # 正在读回或读盘
         self.dead = False            # 已被丢弃（异步任务回来时据此放弃）
         self.want = False            # 已请求换入
+        self.asave = None            # 自动保存记号：(恢复文件的标记, 页面键)，说明这页已经写进当前的恢复文件
 
 
 class LevelGrid:
@@ -689,6 +690,29 @@ class PageCache:
                 spare -= 1
                 budget_bytes -= count * pool.page_bytes
 
+    def request_backup(self, pages) -> int:
+        """尽快把这些只在显存里的页读回内存（自动保存要用，不等空闲时的后台备份）。返回这次发起读回的页数。"""
+        todo: dict[str, list[Page]] = {}
+        for page in pages:
+            if page.slot >= 0 and page.blob is None and page.scratch is None and not page.busy and not page.dead:
+                todo.setdefault(page.fmt, []).append(page)
+        issued = 0
+        for fmt, items in todo.items():
+            if not self.async_readback:
+                for page, data in zip(items, self.fetch_bytes(items)):
+                    self.adopt_bytes(page, data)
+                issued += len(items)
+                continue
+            per_batch = max(1, self.BATCH_BYTES // self.pools[fmt].page_bytes)
+            start = 0
+            while start < len(items) and len(self._free_buffers) > self.KEEP_FOR_EVICTION:
+                count = self._start_readback(items[start:start + per_batch], drop=False)
+                if count <= 0:
+                    break
+                issued += count
+                start += count
+        return issued
+
     # ------------------------------------------------------------------ 纯色检测
     def note_new_pages(self, pages) -> None:
         """刚在显卡上生成的页：排队检查是不是纯色。纯色页只记一个值，换出时不用读回。"""
@@ -846,7 +870,12 @@ class PageCache:
         self.maintain(idle, background)
 
     def begin(self, frame: int, budget_ms: float = 4.0) -> None:
-        """一帧开始：收回读回和读取的结果，把到货的页上传（限时）。"""
+        """一帧开始：收回读回和读取的结果，把到货的页上传（限时）。
+
+        帧号只往前走：同步的大操作（整层滤镜、导出等）会自己往前推帧，之后引擎给的帧号可能落在后面；
+        要是倒回去，那段时间用过的页会一直算「刚用过」，换不出去，下一个大操作就把页池挤满。"""
+        if frame <= self.frame:
+            frame = self.frame + 1
         self.frame = frame
         start = time.perf_counter()
         # 1. 读回完成的批次：压缩交给工作线程（每组若干页）

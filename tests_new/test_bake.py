@@ -305,6 +305,104 @@ class BakeTest(unittest.TestCase):
         self.assertLess(np.median(angle), 4.0)
         self.assertGreater(tilt.mean(), 5.0, "起伏的高模应该烘出有起伏的法线贴图")
 
+    def test_scene_object_high_poly(self):
+        """场景里的模型当高模（比如复制出来再雕刻的那个）：和把同一个模型存成文件当高模烘出来的一样；高模自己不当烘焙目标。"""
+        import tempfile
+
+        from splender.doc.meshio import MeshData
+        tmp = Path(tempfile.mkdtemp())
+        project, ts = make_project("sphere", segments=96, rings=48)
+        ts.meshmap.resolution = "1024"
+        ts.meshmap.ao_samples = 8
+        ts.meshmap.cage_front = 0.06
+        ts.meshmap.cage_back = 0.06
+        low = project.objects[0]
+        positions, normals = bumpy_sphere()
+        tris = len(positions) // 3
+        # 高模和低模共用一套贴图（复制出来再雕刻就是这样），UV 随便给一份：它不该被当成烘焙目标
+        high_mesh = MeshData(name="高模", positions=positions.astype(np.float32), normals=normals.astype(np.float32),
+                             uvs=np.zeros((len(positions), 2), np.float32), material_ids=np.zeros(tris, np.int32),
+                             materials=["材质"], bounds_min=positions.min(axis=0), bounds_max=positions.max(axis=0))
+        high = MeshObject("高模", high_mesh, [ts.uid])
+        project.add_object(high)
+        engine = self.make_engine(project)
+        ts.meshmap.high_poly_object = str(high.uid)
+        job, seconds = bake(engine, ts)
+        self.assertEqual([obj.uid for obj, _mesh, _mats in job._targets], [low.uid], "高模不当烘焙目标")
+        maps = engine.meshmap(ts.uid)
+        self.assertTrue(maps.has_normal)
+        self.assertEqual(maps.meta["settings"]["high_poly_object"], high.uid)
+        arrays = maps.read_arrays()
+        covered = arrays["a"][:, :, 3] > 250
+        scene_t = arrays["t"][:, :, :3].astype(np.float64).copy()
+        Image.fromarray(maps.preview("tangent", 512)).save(OUT / "scene_highpoly_tangent.png")
+        # 同一个高模存成文件，再烘一次比较
+        write_obj(tmp / "high.obj", positions, normals)
+        ts.meshmap.high_poly_object = "0"
+        ts.meshmap.high_poly = str(tmp / "high.obj")
+        bake(engine, ts)
+        file_t = engine.meshmap(ts.uid).read_arrays()["t"][:, :, :3].astype(np.float64)
+        a = scene_t[covered].reshape(-1) - scene_t[covered].mean()
+        b = file_t[covered].reshape(-1) - file_t[covered].mean()
+        corr = float((a * b).sum() / np.sqrt((a * a).sum() * (b * b).sum()))
+        tn = scene_t / 255.0 * 2.0 - 1.0
+        tilt = np.degrees(np.arccos(np.clip(tn[covered, 2] / np.linalg.norm(tn[covered], axis=1), -1, 1)))
+        print("\n场景高模烘焙 %.1f 秒；和文件高模烘出的法线贴图相关系数 %.4f，平均倾斜 %.1f°" % (seconds, corr, tilt.mean()))
+        self.assertGreaterEqual(corr, 0.98)
+        self.assertGreater(tilt.mean(), 5.0, "起伏的高模应该烘出有起伏的法线贴图")
+
+    def test_smooth_maps_and_tiled_padding(self):
+        """位置/朝向/部件贴图可以比遮蔽和法线贴图小：小图正好是大图每格中间那个；按块扩边和整张扩边一样
+        （扩到的正好是离覆盖处不超过扩边半径的那些格，块和块交界处也一样）。"""
+        from scipy.ndimage import distance_transform_edt
+
+        project, ts = make_project("cube", margin=0.03)   # 六块 UV 之间留缝，扩边有地方扩
+        ts.meshmap.resolution = "4096"            # 2×2 块
+        ts.meshmap.smooth_resolution = "4096"
+        ts.meshmap.ao_samples = 4
+        ts.meshmap.padding = 24
+        engine = self.make_engine(project)
+        bake(engine, ts)
+        full = engine.meshmap(ts.uid).read_arrays()
+        full = {key: value.copy() for key, value in full.items()}
+        ts.meshmap.smooth_resolution = "1024"
+        bake(engine, ts)
+        maps = engine.meshmap(ts.uid)
+        small = maps.read_arrays()
+        self.assertEqual(small["a"].shape[:2], (4096, 4096))
+        self.assertEqual(small["t"].shape[:2], (4096, 4096))
+        for key in ("n", "p", "i"):
+            self.assertEqual(small[key].shape[:2], (1024, 1024), key)
+        self.assertEqual(maps.small_size, 1024)
+        # 遮蔽、曲率、厚度不受影响（显卡上同样的两次烘焙，厚度也会有十来个格差 1，不算）
+        diff = np.abs(small["a"].astype(np.int16) - full["a"].astype(np.int16))
+        self.assertLessEqual(int(diff.max()), 1)
+        self.assertLess(int((diff.max(axis=2) > 0).sum()), 200)
+        # 小图每格 = 大图对应 4×4 格中间那个（只比没被扩边的格）
+        covered = small["p"][:, :, 3].astype(np.float32) > 0.9
+        centre_p = full["p"][2::4, 2::4]
+        centre_n = full["n"][2::4, 2::4]
+        centre_i = full["i"][2::4, 2::4]
+        self.assertGreater(int(covered.sum()), 1000)
+        self.assertTrue(np.array_equal(small["p"][covered], centre_p[covered]))
+        self.assertTrue(np.array_equal(small["n"][covered], centre_n[covered]))
+        self.assertTrue(np.array_equal(small["i"][covered], centre_i[covered]))
+        # 扩边：大图里扩到的格 = 没覆盖、但离覆盖处不超过 24 格的那些（块交界处也一样）
+        cov = full["a"][:, :, 3] > 250
+        filled = (full["a"][:, :, 3] > 150) & ~cov
+        reach = distance_transform_edt(~cov) <= 24
+        expected = reach & ~cov
+        mismatch = int((filled != expected).sum())
+        print("\n扩边：应扩 %d 格，实际 %d 格，不一致 %d 格" % (int(expected.sum()), int(filled.sum()), mismatch))
+        self.assertLessEqual(mismatch, max(50, int(expected.sum()) // 2000), "跳跃泛洪是近似的，只允许极少数格不同")
+        boundary = expected[2040:2056, :].sum() + expected[:, 2040:2056].sum()
+        self.assertGreater(int(boundary), 0, "块交界处也有要扩的格")
+        self.assertTrue(np.array_equal(filled[2040:2056, :], expected[2040:2056, :]) and
+                        np.array_equal(filled[:, 2040:2056], expected[:, 2040:2056]), "块交界处扩得和整张一样")
+        # 生成器取样（合成）用的是小图自己的多级：确认合成跑得通、画面正常
+        image = projectio.composite_image(engine, ts, 512)
+        self.assertTrue(np.isfinite(image).all())
+
     def test_cancel_on_geometry_change(self):
         project, ts = make_project("torus")
         engine = self.make_engine(project)

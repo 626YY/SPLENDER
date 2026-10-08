@@ -59,6 +59,9 @@ MAX_PAGE_BYTES = 256 * 1024 * 1024
 JOURNAL_SIZE_LIMIT = 64 * 1024 * 1024
 #: 允许的同步级别。FULL 保证提交后断电不丢；NORMAL 断电可能丢最后一次提交，但文件不坏。
 SYNCHRONOUS_LEVELS = ("NORMAL", "FULL", "EXTRA")
+#: 允许的日志模式。WAL（默认）读写互不阻塞；TRUNCATE 等回滚日志模式在一次写入几 GB 的大事务时快好几倍，
+#: 适合只有一个线程读写的文件（例如自动保存的恢复文件）。
+JOURNAL_MODES = ("WAL", "TRUNCATE", "DELETE", "PERSIST")
 
 _SIDECARS = ("-wal", "-shm", "-journal")
 
@@ -247,13 +250,14 @@ class ProjectFile:
         batch_pages、batch_bytes：write_pages 每批压缩并写入的页数和原始字节上限，满一个就写一批，内存只占约两批。
         synchronous：SQLite 同步级别，NORMAL / FULL / EXTRA，默认 FULL（提交后断电不丢）。
         page_size：新建文件时的 SQLite 页大小（字节，512 到 65536 的 2 的幂），对已有文件无效。
+        journal：日志模式，见 JOURNAL_MODES。默认 WAL；回滚日志模式下读写会互相等待，但大事务快得多。
         cache_mib：写连接的 SQLite 缓存大小（MiB）。读连接各用四分之一。
         timeout：等待文件锁的秒数（别的进程也打开了同一个文件时才会遇到）。
     """
 
     def __init__(self, path: str | os.PathLike, create: bool = False, *, level: int = 3, threads: int = 0,
                  batch_pages: int = 256, batch_bytes: int = 64 * 1024 * 1024, synchronous: str = "FULL",
-                 page_size: int = 16384, cache_mib: int = 64, timeout: float = 30.0):
+                 page_size: int = 16384, cache_mib: int = 64, timeout: float = 30.0, journal: str = "WAL"):
         self.path = os.path.abspath(os.fspath(path))
         self._level = max(-100, min(int(level), zstandard.MAX_COMPRESSION_LEVEL))
         threads = int(threads)
@@ -264,6 +268,10 @@ class ProjectFile:
         if sync not in SYNCHRONOUS_LEVELS:
             raise ValueError(f"synchronous 只能是 {'、'.join(SYNCHRONOUS_LEVELS)} 之一，收到 {synchronous!r}")
         self._synchronous = sync
+        journal = str(journal).upper()
+        if journal not in JOURNAL_MODES:
+            raise ValueError(f"journal 只能是 {'、'.join(JOURNAL_MODES)} 之一，收到 {journal!r}")
+        self._journal = journal
         page_size = int(page_size)
         if page_size < 512 or page_size > 65536 or page_size & (page_size - 1):
             raise ValueError(f"page_size 应是 512 到 65536 之间的 2 的幂，收到 {page_size}")
@@ -332,7 +340,7 @@ class ProjectFile:
 
     def _create_schema(self, conn: sqlite3.Connection) -> None:
         conn.execute(f"PRAGMA page_size={self._page_size}")
-        conn.execute("PRAGMA journal_mode=WAL").fetchall()
+        conn.execute(f"PRAGMA journal_mode={self._journal}").fetchall()
         conn.execute("BEGIN IMMEDIATE")
         try:
             for sql in _SCHEMA:
@@ -368,9 +376,9 @@ class ProjectFile:
                                           f"{', '.join(sorted(missing))}，文件已损坏：{path}", path)
 
     def _configure_writer(self, conn: sqlite3.Connection) -> None:
-        mode = str(conn.execute("PRAGMA journal_mode=WAL").fetchone()[0]).lower()
+        mode = str(conn.execute(f"PRAGMA journal_mode={self._journal}").fetchone()[0]).lower()
         self.journal_mode = mode
-        if mode != "wal":
+        if self._journal == "WAL" and mode != "wal":
             log.warning("工程文件不能使用 WAL 日志（当前 %s），后台读取会在保存时等待：%s", mode, self.path)
         conn.execute(f"PRAGMA synchronous={self._synchronous}")
         conn.execute(f"PRAGMA cache_size=-{self._cache_kib}")
@@ -814,6 +822,19 @@ class ProjectFile:
             for codec, raw_len, blob in f.result():
                 rows.append((*next(it), codec, raw_len, blob))
         conn.executemany(_UPSERT_PAGE, rows)
+
+    def copy_pages_from(self, other: "ProjectFile", batch: int = 256) -> int:
+        """把另一个工程文件里的全部页面原样（不解压、不重新压缩）抄进来，同键覆盖。一个事务。返回抄了多少页。"""
+        count = 0
+        with other._reader("读取页面") as src, self._write_tx("复制页面") as conn:
+            cursor = src.execute("SELECT layer_uid, plane, mip, tx, ty, codec, raw_len, data FROM pages")
+            while True:
+                rows = cursor.fetchmany(max(1, int(batch)))
+                if not rows:
+                    break
+                conn.executemany(_UPSERT_PAGE, rows)
+                count += len(rows)
+        return count
 
     def delete_pages(self, keys: Iterable[PageKey]) -> None:
         """删除一批页面（一个事务）。"""

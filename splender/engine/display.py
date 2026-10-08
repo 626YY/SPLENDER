@@ -195,7 +195,7 @@ uniform sampler2D u_idsel;    // 每个图层一行：这个部件选中了没�
 uniform sampler2DArray u_graph0; uniform sampler2DArray u_graph1; uniform sampler2DArray u_graph2;
 uniform sampler2DArray u_graph3; uniform sampler2DArray u_graph4; uniform sampler2DArray u_graph5;
 uniform float u_graph_res[6];
-uniform int u_has_maps; uniform float u_map_lod; uniform float u_level_texels; uniform float u_ao_mix;
+uniform int u_has_maps; uniform float u_map_lod; uniform float u_map_lod_s; uniform float u_level_texels; uniform float u_ao_mix;
 uniform vec3 u_bmin; uniform vec3 u_bmax;
 flat in ivec4 v_job;
 layout(location=0) out vec4 o_color;
@@ -577,8 +577,8 @@ void main(){{
   g_id = -1.0;
   if (u_has_maps == 1) {{
     g_ma = textureLod(u_map_a, map_uv, u_map_lod);
-    g_mn = textureLod(u_map_n, map_uv, u_map_lod).xyz * 2.0 - 1.0;
-    g_mp = textureLod(u_map_p, map_uv, u_map_lod).xyz;
+    g_mn = textureLod(u_map_n, map_uv, u_map_lod_s).xyz * 2.0 - 1.0;
+    g_mp = textureLod(u_map_p, map_uv, u_map_lod_s).xyz;
     ivec2 isz = textureSize(u_map_i, 0);
     g_id = texelFetch(u_map_i, clamp(ivec2(map_uv * vec2(isz)), ivec2(0), isz - 1), 0).r;
   }}
@@ -875,6 +875,10 @@ class Compositor:
         if "u_map_lod" in program:
             lod = math.log2(self.maps.size / max(1.0, float(level_texels))) if self.maps is not None else 0.0
             program["u_map_lod"] = float(max(0.0, lod))
+            if "u_map_lod_s" in program:
+                small = float(getattr(self.maps, "small_size", 0) or 0) if self.maps is not None else 0.0
+                lod_s = math.log2(small / max(1.0, float(level_texels))) if small > 0 else 0.0
+                program["u_map_lod_s"] = float(max(0.0, lod_s))
         program["u_target"] = (float(size[0]), float(size[1]))
         program["u_origin"] = (float(origin[0]), float(origin[1]))
         program["u_origin_i"] = (int(origin[0]), int(origin[1]))

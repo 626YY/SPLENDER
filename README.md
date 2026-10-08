@@ -4,7 +4,7 @@
 
 > An all-in-one app for sculpting, 16K texture painting, procedural materials and rendering (Python + ModernGL, Chinese UI).
 
-现在完成的是：程序骨架和插件系统；物体模式、编辑模式；雕刻（十种笔刷、细分、体素重构、自动展开 UV）；流畅绘制 16K 贴图（图层和文件夹，Photoshop 的调整层、滤镜、绘制工具和选区）；模型贴图烘焙、生成器蒙版和 11 种智能材质；材质节点和节点纹理；四个渲染引擎（工作台、实时、路径追踪、Arnold 插件）。每一版的变化见 [docs/CHANGELOG.md](docs/CHANGELOG.md)。方案、进度和实测数据见 [docs/SPLENDER_PLAN_v2.md](docs/SPLENDER_PLAN_v2.md)，代码约定见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)。
+现在完成的是：程序骨架和插件系统；物体模式、编辑模式；雕刻（十种笔刷、细分、体素重构、自动展开 UV）；流畅绘制 16K 贴图（图层和文件夹，Photoshop 的调整层、滤镜、绘制工具和选区）；模型贴图烘焙（到 16K，可以用场景里雕好的模型当高模）、生成器蒙版和 11 种智能材质；材质节点和节点纹理；四个渲染引擎（工作台、实时、路径追踪、Arnold 插件）；导出模型（glb、obj，贴图一起）；自动保存和意外退出后的恢复；能改键位；数位板支持 Windows Ink 和 WinTab。每一版的变化见 [docs/CHANGELOG.md](docs/CHANGELOG.md)。方案、进度和实测数据见 [docs/SPLENDER_PLAN_v2.md](docs/SPLENDER_PLAN_v2.md)，代码约定见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)。
 
 ## 截图
 
@@ -23,7 +23,7 @@
 - **从源码运行**：装 64 位 Python 3.11，`pip install -r requirements.txt`，然后在仓库目录里运行 `python -m splender`。
 - **自己打便携包**：`python tools/make_package.py`，在上一级目录的 `SPLENDER_dist` 里得到 zip。启动器 `SPLENDER.exe` 的源码在 `tools/launcher/`。
 
-第一次打开是一个预览球，可以直接画。用「文件 → 导入模型」换成自己的模型（OBJ、glTF、GLB）。
+第一次打开是一个预览球，可以直接画。用「文件 → 导入模型」换成自己的模型（OBJ、glTF、GLB），「文件 → 导入到当前场景」把模型加进现在的工程，「文件 → 导出模型」导出 glb 或 obj（贴图一起）。程序意外退出后再打开会问要不要恢复自动保存；键位在「文件 → 偏好设置 → 键位」里改。
 
 ## 常用操作
 

@@ -9,7 +9,7 @@ import os
 
 from ..core import ops
 from ..core.ops import CANCELLED, FINISHED, Operator
-from ..core.props import EnumProperty, StringProperty
+from ..core.props import BoolProperty, EnumProperty, FloatProperty, StringProperty
 from ..paths import log_dir
 
 log = logging.getLogger("splender.ops.file")
@@ -82,6 +82,35 @@ class WMImportMesh(Operator):
             return CANCELLED
         try:
             ctx.app.import_mesh(path)
+        except Exception as error:  # noqa: BLE001
+            log.exception("导入模型失败")
+            self.report(ctx, "没有导入：%s" % error, "ERROR")
+            return CANCELLED
+        return FINISHED
+
+
+@ops.register
+class WMImportToScene(Operator):
+    idname = "wm.import_to_scene"
+    label = "导入到当前场景…"
+    description = "把模型文件里的模型加进当前场景（每个材质一套新贴图），不新建工程。比如导进一个高模用来烘焙"
+    icon = "import"
+    filepath = StringProperty("文件", default="", subtype="FILE_PATH")
+
+    @classmethod
+    def poll(cls, ctx) -> bool:
+        return ctx.project is not None and ctx.engine is not None
+
+    def execute(self, ctx) -> str:
+        path = self.filepath
+        if not path:
+            from PySide6.QtWidgets import QFileDialog
+
+            path, _ = QFileDialog.getOpenFileName(ctx.app.window, "导入到当前场景", _start_dir(ctx), MESH_FILTER)
+        if not path:
+            return CANCELLED
+        try:
+            ctx.app.import_into_scene(path)
         except Exception as error:  # noqa: BLE001
             log.exception("导入模型失败")
             self.report(ctx, "没有导入：%s" % error, "ERROR")
@@ -248,6 +277,57 @@ class WMExportTextures(Operator):
         return FINISHED
 
 
+MESH_EXPORT_FILTER = "glTF 二进制 (*.glb);;OBJ (*.obj)"
+
+
+@ops.register
+class WMExportMesh(Operator):
+    idname = "wm.export_mesh"
+    label = "导出模型…"
+    description = "把模型导出成 glTF 二进制（.glb，贴图装在里面）或 OBJ（旁边写 PNG 和材质文件）"
+    icon = "export"
+    filepath = StringProperty("文件", default="", subtype="FILE_PATH")
+    scope = EnumProperty("范围", items=[("VISIBLE", "全部可见的模型", ""), ("SELECTED", "选中的模型", "")],
+                         default="VISIBLE")
+    with_textures = BoolProperty("连贴图一起导出", default=True)
+    size = EnumProperty("贴图尺寸", items=[("0", "按纹理集设置", ""), ("8192", "8K", ""), ("4096", "4K", ""),
+                                       ("2048", "2K", ""), ("1024", "1K", "")], default="0")
+    scale = FloatProperty("缩放", default=1.0, min=0.0001, max=10000.0, precision=4)
+
+    @classmethod
+    def poll(cls, ctx) -> bool:
+        return ctx.project is not None and bool(ctx.project.objects) and ctx.engine is not None
+
+    def execute(self, ctx) -> str:
+        path = self.filepath
+        if not path:
+            from PySide6.QtWidgets import QFileDialog
+
+            start = ctx.app.prefs.files.export_dir or _start_dir(ctx)
+            suggested = os.path.join(start, (ctx.project.name or "模型") + ".glb")
+            path, _ = QFileDialog.getSaveFileName(ctx.app.window, "导出模型", suggested, MESH_EXPORT_FILTER)
+        if not path:
+            return CANCELLED
+        if not os.path.splitext(path)[1]:
+            path += ".glb"
+        project = ctx.project
+        objects = [obj for obj in project.objects if obj.visible]
+        if self.scope == "SELECTED":
+            objects = [obj for obj in objects if obj.select]
+        if not objects:
+            self.report(ctx, "没有可以导出的模型" + ("（没有选中的）" if self.scope == "SELECTED" else ""), "WARNING")
+            return CANCELLED
+        try:
+            ctx.app.export_meshes(path, objects, with_textures=self.with_textures, size=int(self.size) or None,
+                                  scale=float(self.scale))
+        except Exception as error:  # noqa: BLE001
+            log.exception("导出模型失败")
+            ctx.wm.set_progress("", None)
+            self.report(ctx, "没有导出：%s" % error, "ERROR")
+            return CANCELLED
+        return FINISHED
+
+
 @ops.register
 class WMPreferences(Operator):
     idname = "wm.preferences"
@@ -273,6 +353,67 @@ class WMPreferences(Operator):
             window.move(center.x() - window.width() // 2, center.y() - window.height() // 2)
         window.show()
         ctx.app._prefs_window = window
+        return FINISHED
+
+
+@ops.register
+class WMRecoverAutosave(Operator):
+    idname = "wm.recover_autosave"
+    label = "恢复自动保存…"
+    description = "列出程序意外退出时留下的自动保存，选一份恢复成工程文件"
+    icon = "recover"
+
+    def execute(self, ctx) -> str:
+        from ..ui.recovery_dialog import RecoveryDialog
+
+        try:
+            items, _ended = ctx.app.autosave_scan()
+        except Exception as error:  # noqa: BLE001
+            log.exception("查找自动保存时出错")
+            self.report(ctx, "找不到自动保存：%s" % error, "ERROR")
+            return CANCELLED
+        if not items:
+            self.report(ctx, "没有可以恢复的自动保存")
+            return CANCELLED
+        RecoveryDialog(ctx.app, items).exec()
+        return FINISHED
+
+
+@ops.register
+class WMRestoreAutosave(Operator):
+    idname = "wm.restore_autosave"
+    label = "恢复这份自动保存"
+    description = "把这份自动保存还原成一个新的工程文件并打开"
+    searchable = False
+    filepath = StringProperty("文件", default="", subtype="FILE_PATH")
+
+    def execute(self, ctx) -> str:
+        if not self.filepath or not os.path.isfile(self.filepath):
+            self.report(ctx, "这份自动保存已经不在了", "WARNING")
+            return CANCELLED
+        if not confirm_discard(ctx):
+            return CANCELLED
+        try:
+            ctx.app.restore_autosave(self.filepath)
+        except Exception as error:  # noqa: BLE001
+            log.exception("恢复自动保存失败")
+            self.report(ctx, "没有恢复：%s" % error, "ERROR")
+            return CANCELLED
+        return FINISHED
+
+
+@ops.register
+class WMCopyDiagnostics(Operator):
+    idname = "wm.copy_diagnostics"
+    label = "复制诊断信息"
+    description = "把版本、系统、显卡、工程概况和最近的日志复制到剪贴板，反馈问题时贴上"
+    icon = "diagnostics"
+
+    def execute(self, ctx) -> str:
+        from ..core import diagnostics
+
+        diagnostics.copy_to_clipboard(ctx.app)
+        self.report(ctx, "诊断信息已复制到剪贴板")
         return FINISHED
 
 

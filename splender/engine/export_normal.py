@@ -89,8 +89,8 @@ def surface_scale(project, ts) -> tuple:
     return per_uv, (radius or 1.0)
 
 
-def export_normal(engine, ts, path: str, progress=None, size: int | None = None) -> dict:
-    """把这套贴图的法线导出成 PNG（RGB，8 或 16 位）。"""
+def export_normal(engine, ts, path: str, progress=None, size: int | None = None, opengl: bool = False) -> dict:
+    """把这套贴图的法线导出成 PNG（RGB，8 或 16 位）。opengl 为真时不管纹理集的设置，一律按 OpenGL（绿色朝上，glTF 要这样）。"""
     from .export_png import PngStreamWriter
     from .projectio import compose_row
 
@@ -145,7 +145,7 @@ def export_normal(engine, ts, path: str, progress=None, size: int | None = None)
             program["u_row"] = int(row)
             program["u_size"] = float(size)
             program["u_slope"] = float(slope)
-            program["u_flip_green"] = 1 if ts.meshmap.normal_format == "DIRECTX" else 0
+            program["u_flip_green"] = 1 if (ts.meshmap.normal_format == "DIRECTX" and not opengl) else 0
             out_fbo.use()
             ctx.viewport = (0, 0, width, PAGE)
             ctx.disable(moderngl.DEPTH_TEST | moderngl.CULL_FACE | moderngl.BLEND)

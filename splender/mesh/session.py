@@ -203,6 +203,8 @@ class EditOverlay:
 class EditSession:
     def __init__(self, engine, obj) -> None:
         started = time.perf_counter()
+        self.version = 0
+        self._changed = False
         self.engine = engine
         self.obj = obj
         self.entry_snapshot = snapshot_mesh(obj.data)
@@ -217,6 +219,17 @@ class EditSession:
         self.update_overlay()
         log.info("进入编辑模式：%s，%d 个点、%d 个面，用时 %.2f 秒", obj.name, self.mesh.vert_count, self.mesh.face_count,
                  time.perf_counter() - started)
+
+    # 「编辑以来改没改过形状」；每次标成 True 都换一个新版本号（自动保存据此判断形状变没变）
+    @property
+    def changed(self) -> bool:
+        return self._changed
+
+    @changed.setter
+    def changed(self, value: bool) -> None:
+        self._changed = bool(value)
+        if value:
+            self.version += 1
 
     # ---------------------------------------------------------------- 显示
     def sync(self, topology: bool = True) -> None:

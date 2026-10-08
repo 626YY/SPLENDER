@@ -32,6 +32,8 @@ QT_MODULES = {"Core", "Gui", "Widgets", "Svg", "SvgWidgets", "OpenGL", "OpenGLWi
               "PrintSupport"}
 QT_PLUGINS = {"platforms", "styles", "imageformats", "iconengines", "generic", "platforminputcontexts"}
 QT_DROP_DIRS = {"resources", "qml", "metatypes", "translations", "include", "typesystems", "glue", "doc", "lib", "scripts"}
+#: 翻译目录里只留 Qt 自带窗口（消息框按钮、文件对话框等）的中文
+QT_KEEP = ("PySide6/translations/qtbase_zh_CN.qm",)
 QT_DROP_FILES = ("*.exe", "*.lib", "pyside6qml*", "av*.dll", "sw*.dll")
 OTHER_DROP = ("cv2/opencv_videoio_ffmpeg*.dll",)          # OpenCV 的视频读写，用不到
 STDLIB_DROP = {"test", "idlelib", "tkinter", "turtledemo", "ensurepip", "site-packages"}
@@ -40,7 +42,9 @@ PYTHON_FILES = ("python311.dll", "python3.dll", "python.exe", "pythonw.exe", "vc
                 "LICENSE.txt")
 PROGRAM_DIRS = ("splender", "tools", "tests_new", "docs", "runtime/site-packages")
 PROGRAM_FILES = ("SPLENDER.exe", "README.md", "LICENSE", "THIRD_PARTY_NOTICES.md")
-SKIP = {"__pycache__", "evidence", ".devuser", "legacy"}
+SKIP = {"__pycache__", "evidence", ".devuser", "legacy", ".cache"}
+#: pip 装库时记下的「从哪装的」（direct_url.json 里是本机的文件路径），对用包的人没用，不带
+SKIP_FILES = {"direct_url.json"}
 #: 给自己用的工具和内部文档，不放进包里
 PRIVATE = {"tools/baidu_upload.py", "tools/export_open_source.py", "docs/ROADMAP.md"}
 #: python311._pth：相对它所在的 runtime/python。..\.. 是程序目录，..\site-packages 是内置的几个库。
@@ -54,7 +58,7 @@ def _skip(directory, names) -> set:
     here = Path(directory)
     rel = here.relative_to(ROOT) if here.is_relative_to(ROOT) else Path()
     return {name for name in names
-            if name in SKIP or name.endswith(".pyc") or (rel / name).as_posix() in PRIVATE}
+            if name in SKIP or name in SKIP_FILES or name.endswith(".pyc") or (rel / name).as_posix() in PRIVATE}
 
 
 def copy_program(dest: Path) -> None:
@@ -147,6 +151,8 @@ def _dropped(rel: Path) -> bool:
     parts = rel.parts
     if parts[0] != "PySide6" or len(parts) < 2:
         return False
+    if text in QT_KEEP:
+        return False
     if parts[1] in QT_DROP_DIRS:
         return True
     if parts[1] == "plugins":
@@ -166,7 +172,7 @@ def copy_distribution(dist, site: Path, stats: dict) -> None:
     if files is None:
         raise SystemExit("发行包 %s 没有文件清单（RECORD）" % dist.metadata["Name"])
     for item in files:
-        if ".." in item.parts or "__pycache__" in item.parts or item.suffix == ".pyc":
+        if ".." in item.parts or "__pycache__" in item.parts or item.suffix == ".pyc" or item.name in SKIP_FILES:
             continue
         source = Path(dist.locate_file(item))
         if not source.is_file():
@@ -200,6 +206,31 @@ def write_readme(folder: Path, name: str) -> Path:
     # 带 BOM：老版本的记事本也认得是 UTF-8
     target.write_text(template.format(name=name, changes=latest_changes()), encoding="utf-8-sig")
     return target
+
+
+def privacy_scan(folder: Path) -> list[str]:
+    """包里不能有这台电脑的信息：用户名、用户目录（原样、URL 编码、UTF-16 都查）。返回有问题的文件。"""
+    import os
+    import urllib.parse
+
+    home = os.path.expanduser("~")
+    user = os.path.basename(home)
+    needles = {home, home.replace("\\", "/"), urllib.parse.quote(home.replace("\\", "/"))}
+    if len(user) >= 3 or any(ord(ch) > 127 for ch in user):      # 太短的英文名会误报，不单独查
+        needles |= {user, urllib.parse.quote(user)}
+    patterns = set()
+    for needle in needles:
+        if needle:
+            patterns.add(needle.encode("utf-8"))
+            patterns.add(needle.encode("utf-16-le"))
+    found = []
+    for path in sorted(folder.rglob("*")):
+        if not path.is_file() or path.stat().st_size > 8 << 20:
+            continue
+        data = path.read_bytes()
+        if any(pattern in data for pattern in patterns):
+            found.append(str(path.relative_to(folder)))
+    return found
 
 
 def make_zip(folder: Path, target: Path) -> None:
@@ -244,6 +275,12 @@ def main(argv: list | None = None) -> int:
     print("发行包：%s" % "、".join("%s %s" % (d.metadata["Name"], d.version) for d in dists))
     print("库：带上 %.0f MB，去掉用不到的 %.0f MB" % (stats["kept"] / 2 ** 20, stats["dropped"] / 2 ** 20))
     print("文件夹 %s：%.0f MB" % (folder, folder_size(folder) / 2 ** 20))
+    leaks = privacy_scan(folder)
+    if leaks:
+        print("包里有这台电脑的信息（用户名或用户目录），不压缩：")
+        for item in leaks:
+            print("  " + item)
+        return 1
     if not args.no_zip:
         target = out / (name + ".zip")
         make_zip(folder, target)

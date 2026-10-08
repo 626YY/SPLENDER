@@ -11,7 +11,7 @@ FILES = ["test_storage.py", "test_meshio.py", "test_modules.py", "test_ui_offscr
          "test_geometry.py", "test_bake.py", "test_normal_map.py", "test_parts.py", "test_nodes.py", "test_transfer.py", "test_folders.py", "test_engine_paint.py", "test_uv_paint.py", "test_engine_io.py",
          "test_objects.py", "test_lights.py", "test_editmode.py", "test_material_nodes.py", "test_resize.py", "test_keymap.py",
          "test_adjust.py", "test_filters.py",
-         "test_effect_brushes.py", "test_selection.py"]
+         "test_effect_brushes.py", "test_selection.py", "test_recovery.py", "test_autosave.py", "test_meshexport.py", "test_wintab.py"]
 
 
 def main() -> int:

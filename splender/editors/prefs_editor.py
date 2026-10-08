@@ -2,9 +2,9 @@
 from __future__ import annotations
 
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QHBoxLayout, QScrollArea, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QHBoxLayout, QScrollArea, QWidget
 
-from ..core import ops, registry
+from ..core import registry
 from ..core.props import PointerProperty
 from ..ui import theme
 from ..ui.editor import Editor
@@ -138,24 +138,15 @@ class PreferencesEditor(Editor):
             layout.separator()
 
     def _draw_keymap(self, layout) -> None:
+        from ..ui.keymap_editor import KeymapWidget
+
         layout.label("键位", role="title")
-        layout.label("默认键位对齐 Blender：中键旋转，Shift+中键平移，滚轮缩放。", role="dim")
+        layout.label("默认键位对齐 Blender：中键旋转，Shift+中键平移，滚轮缩放。点快捷键那一格再按新的键就改好了，"
+                     "改动立即生效、自动保存。", role="dim")
         layout.separator()
-        kc = self.app.keyconfig
-        titles = {"Window": "全局", "Screen": "窗口布局", "3D View": "3D 视口", "Paint": "绘制", "Image": "UV / 图像",
-                  "Layers": "图层"}
-        for name, km in kc.keymaps.items():
-            layout.label(titles.get(name, name), role="title")
-            for item in km.items:
-                cls = ops.get(item.op)
-                if cls is None:
-                    continue
-                text = cls.label
-                if item.props:
-                    text += "（%s）" % "，".join(str(v) for v in item.props.values())
-                row = layout.row(heading=text)
-                row.label(item.shortcut_text(), role="dim")
-            layout.separator()
+        self.keymap_widget = KeymapWidget(self.app)
+        self.keymap_widget.setMinimumHeight(theme.px(560))
+        layout.widget(self.keymap_widget, stretch=1)
 
     def refresh(self) -> None:
         super().refresh()

@@ -307,13 +307,32 @@ class InputForwarder(QObject):
         nav = getattr(prefs, "navigation", None)
         return bool(getattr(nav, "emulate_3_button", False))
 
+    def _tablet_mode(self) -> str:
+        app = getattr(self._editor, "app", None)
+        mode = getattr(app, "tablet_mode", None)
+        return mode() if callable(mode) else "AUTO"
+
+    def _from_wintab(self, event: Event) -> None:
+        """鼠标事件：WinTab 开着、笔就在板子上时，补上压感、倾斜、橡皮端（驱动里关了 Windows Ink 时靠它）。"""
+        tablet = getattr(getattr(self._editor, "app", None), "wintab", None)
+        if tablet is None or not tablet.ok:
+            return
+        from .wintab import annotate
+
+        annotate(event, tablet.poll())
+
     def eventFilter(self, obj: QObject, qev: QEvent) -> bool:  # noqa: N802
         t = qev.type()
         if t in self._MOUSE:
             event = mouse_event(qev, self._widget, self._prev)
+            if event is not None:
+                self._from_wintab(event)
         elif t == QEvent.Wheel:
             event = wheel_event(qev, self._widget)
         elif t in self._TABLET:
+            if self._tablet_mode() == "WINTAB":
+                qev.ignore()                     # 不用 Windows Ink 的笔事件：让 Qt 合成鼠标事件，压感从 WinTab 补
+                return False
             event = tablet_event(qev, self._widget, self._prev)
         else:
             return False

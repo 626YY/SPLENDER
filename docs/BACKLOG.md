@@ -28,6 +28,8 @@
 - [ ] B10 PS 快捷键（在 2D 画布、图层面板、绘制时，不和 Blender 冲突的地方）：B、E、[ ]、X、D 默认色、I 吸管、Alt+点击取色、数字键不透明度、Shift+数字流量、Ctrl+J 复制图层、Ctrl+E 向下合并、Ctrl+Shift+N 新图层、Ctrl+G 编组、Ctrl+T 自由变换、Ctrl+L 色阶、Ctrl+M 曲线、Ctrl+U 色相、Ctrl+I 反相、Ctrl+Shift+U 去色、Ctrl+A 全选、Ctrl+D 取消选择、Ctrl+Shift+I 反选、M/L/W 选择工具、G 渐变/油漆桶、S 仿制、J 修复、O 减淡加深、T 文字、U 形状、H 抓手、Z 缩放、空格临时抓手、Ctrl+0 适合、Ctrl+1 100%、Alt+Backspace 填前景色、Ctrl+Backspace 填背景色
   （已做：B、E、[ ]、X、D 默认色、I 和 Alt+点击取色、数字键不透明度、Shift+数字流量、Ctrl+J 复制图层、Ctrl+Shift+N 新图层、Ctrl+G 编组、Ctrl+L 色阶、Ctrl+U 色相、Ctrl+I 反相、Ctrl+Shift+U 去色、Alt+Backspace 填前景色、Ctrl+Backspace 填背景色、Ctrl+0 适合、Ctrl+1 100%；还差：Ctrl+E 向下合并、Ctrl+T 自由变换、Ctrl+M 曲线、选区和选择工具、渐变、仿制、修复、减淡加深、文字、形状、空格临时抓手——跟着 F 组的 2D 画布做）
 - [x] B11 键位自动测试（test_keymap.py）：每一条都指向存在的操作、属性名和取值对、菜单和工具存在、同一张表里没有被盖住的重复键
+- [x] B12 改键：偏好设置的键位页能搜索、点快捷键再按新键改（键盘、鼠标键、滚轮）、停用、单条和全部恢复出厂，同一个键会互相挡住时橙色提醒；
+  只存和出厂不一样的（keymap_overrides），按「表、操作、参数、出厂键」认，出厂键位以后增删换顺序也认得出
 
 ## C. 界面：照 Blender 和 SP 的形式
 
@@ -70,9 +72,9 @@
 
 ## G. 之前列的
 
-- [ ] G1 导出模型：OBJ（四边形、材质分组、MTL）和 glTF .glb（PBR 贴图打包）
+- [x] G1 导出模型：OBJ（四边形、材质分组、MTL）和 glTF .glb（基础色、法线、ORM 打包）；导出面板「连模型一起导出」
 - [ ] G2 发送到 Blender（导出 glb + 高度，后台打开 Blender 并设好材质）
-- [ ] G3 自动保存
+- [x] G3 自动保存：定时另存恢复文件（只写改动，按帧分摊、写盘线程压缩），意外退出后启动时问要不要恢复；崩溃报告、出错提示、复制诊断信息
 - [ ] G4 UDIM
 - [ ] G5 雕刻图层
 - [ ] G6 多分辨率

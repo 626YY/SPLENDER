@@ -39,6 +39,8 @@ CHANNEL_LABELS = {c[0]: c[1] for c in CHANNELS}
 EXPORT_ITEMS = [("basecolor", "基础色"), ("metallic", "金属度"), ("roughness", "粗糙度"), ("height", "高度"),
                 ("normal", "法线"), ("ao", "环境遮蔽")]
 EXPORT_IDS = [c[0] for c in EXPORT_ITEMS]
+MESH_FORMAT_ITEMS = [("GLB", "glTF 二进制 (.glb)", "一个文件，基础色、法线和遮蔽粗糙度金属度打包贴图都装在里面"),
+                     ("OBJ", "OBJ", "模型和材质文件（.mtl），材质文件引用导出的 PNG")]
 EXPORT_LABELS = dict(EXPORT_ITEMS)
 EXPORT_SIZE_ITEMS = [("0", "原始尺寸", "和纹理集一样大"), ("8192", "8K", ""), ("4096", "4K", ""), ("2048", "2K", ""),
                      ("1024", "1K", ""), ("512", "512", "")]
@@ -75,7 +77,8 @@ DIRECTION_ITEMS = [("UP", "上", "朝上（+Y）"), ("DOWN", "下", "朝下（-Y
                    ("BACK", "后", "朝后（-Z）"), ("RIGHT", "右", "朝右（+X）"), ("LEFT", "左", "朝左（-X）")]
 DIRECTION_VECTOR = {"UP": (0.0, 1.0, 0.0), "DOWN": (0.0, -1.0, 0.0), "FRONT": (0.0, 0.0, 1.0),
                     "BACK": (0.0, 0.0, -1.0), "RIGHT": (1.0, 0.0, 0.0), "LEFT": (-1.0, 0.0, 0.0)}
-MESHMAP_RESOLUTION_ITEMS = [("1024", "1K", ""), ("2048", "2K", ""), ("4096", "4K", "")]
+MESHMAP_RESOLUTION_ITEMS = [("1024", "1K", ""), ("2048", "2K", ""), ("4096", "4K", ""), ("8192", "8K", ""),
+                            ("16384", "16K", "")]
 
 # ---- 图层种类 ----
 LAYER_KIND_ITEMS = [("PAINT", "绘制层", "用笔刷画的内容"), ("FILL", "填充层", "整层统一的数值"),
@@ -395,7 +398,10 @@ class MeshMapSettings(PropertyGroup):
     """模型贴图的烘焙设置。"""
 
     resolution = EnumProperty("分辨率", items=MESHMAP_RESOLUTION_ITEMS, default="2048",
-                              description="模型贴图的大小。生成器蒙版按它取样，随机纹理不受影响")
+                              description="遮蔽、曲率、厚度、法线贴图的大小。生成器蒙版按它取样，随机纹理不受影响")
+    smooth_resolution = EnumProperty("位置/朝向/部件最大", items=MESHMAP_RESOLUTION_ITEMS, default="4096",
+                                     description="世界位置、世界朝向、部件这三张变化平缓（部件只看边界）的贴图最多做多大。"
+                                                 "比上面的分辨率小时省很多显存：16K 时从约 8 GB 降到约 3 GB")
     ao_samples = IntProperty("遮蔽采样", default=64, min=4, max=1024,
                              description="每个像素发多少条光线算遮蔽。越多越干净，也越慢")
     ao_distance = FloatProperty("遮蔽距离", default=0.15, min=0.0, max=1.0, subtype="FACTOR", precision=3,
@@ -415,6 +421,8 @@ class MeshMapSettings(PropertyGroup):
     ao_strength = FloatProperty("遮蔽强度", default=1.0, min=0.0, max=1.0, subtype="FACTOR", precision=2)
     auto_rebake = BoolProperty("形状改了自动重烘", default=True,
                                description="雕刻、重构之后回到绘制模式时，自动重新烘焙模型贴图")
+    high_poly_object = EnumProperty("高模（场景里的）", items=lambda owner: _scene_mesh_items(owner), default="0",
+                                    description="用场景里的一个模型当高模（比如雕刻好的那个，可以隐藏起来）。选了它就不用下面的文件")
     high_poly = StringProperty("高模", default="", subtype="FILE_PATH",
                                description="从这个模型文件（OBJ、glTF）烘焙细节：法线贴图、遮蔽、曲率、厚度都按它算。空着就只用当前模型")
     cage_front = FloatProperty("向外找", default=0.02, min=0.0, max=1.0, subtype="FACTOR", precision=3,
@@ -450,6 +458,9 @@ class ExportSettings(PropertyGroup):
                                     description="手绘高度变成法线时的强弱。1 和视口里看到的一样")
     normal_depth = EnumProperty("法线位深", items=[("8", "8 位", "通用"), ("16", "16 位", "渐变更平滑，文件更大")],
                                 default="8")
+    with_mesh = BoolProperty("连模型一起导出", default=False,
+                             description="导出贴图时，把用到这套贴图的模型也导出到同一个文件夹")
+    mesh_format = EnumProperty("模型格式", items=MESH_FORMAT_ITEMS, default="GLB")
 
 
 class TextureSet(PropertyGroup):
@@ -888,6 +899,21 @@ class EffectSettings(PropertyGroup):
     offset_v = FloatProperty("偏移 V", default=0.0, hidden=True, save=False)
 
 
+def _scene_mesh_items(_owner=None):
+    """可以当高模的：当前工程里的模型（标识是模型的编号）。"""
+    items = [("0", "不用", "不用场景里的模型")]
+    try:
+        from ..app import instance
+
+        app = instance()
+        project = getattr(app, "project", None)
+    except Exception:  # noqa: BLE001
+        project = None
+    for obj in getattr(project, "objects", []) or []:
+        items.append((str(obj.uid), obj.name, "用场景里的「%s」当高模" % obj.name))
+    return items
+
+
 def _font_items(_owner=None):
     """系统里装的字体（第一项是界面默认字体）。"""
     cached = getattr(_font_items, "cache", None)
@@ -1089,8 +1115,15 @@ class ViewOverlay(PropertyGroup):
     wireframe_opacity = FloatProperty("线框不透明度", default=0.6, min=0.0, max=1.0, subtype="FACTOR", precision=2)
 
 
+#: 模型形状的版本号（全局递增，不同模型、删了又建的模型也不会撞号）：自动保存据此判断形状变没变
+_geometry_serial = itertools.count(1)
+
+
 class MeshObject(PropertyGroup):
-    """一个模型。data 是 meshio.MeshData；material_sets[i] 是第 i 个材质对应的纹理集 uid。"""
+    """一个模型。data 是 meshio.MeshData；material_sets[i] 是第 i 个材质对应的纹理集 uid。
+
+    geometry_dirty：形状相对工程文件改过、保存时要重写模型数据。每次标成 True 都换一个新的 geometry_version。
+    """
 
     kind = "MESH"
     undoable = True
@@ -1107,6 +1140,18 @@ class MeshObject(PropertyGroup):
         self.data = data
         self.material_sets = material_sets
         self.transform = ObjectTransform()      # 当前变换（顶点已经是变换后的世界坐标）
+        self._geometry_dirty = False
+        self.geometry_version = next(_geometry_serial)
+
+    @property
+    def geometry_dirty(self) -> bool:
+        return self._geometry_dirty
+
+    @geometry_dirty.setter
+    def geometry_dirty(self, value: bool) -> None:
+        self._geometry_dirty = bool(value)
+        if value:
+            self.geometry_version = next(_geometry_serial)
 
 
 class Project:

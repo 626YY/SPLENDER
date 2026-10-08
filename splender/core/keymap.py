@@ -5,9 +5,14 @@
 """
 from __future__ import annotations
 
+import json
+import logging
 import time
+from collections import Counter
 from dataclasses import dataclass, field
 from typing import Any
+
+log = logging.getLogger("splender.keymap")
 
 # 事件值
 PRESS = "PRESS"
@@ -68,6 +73,7 @@ class KeyMapItem:
     repeat: bool = False
     props: dict = field(default_factory=dict)
     active: bool = True
+    default: tuple | None = field(default=None, compare=False, repr=False)   # 出厂时的 KEY_FIELDS（改键用）
 
     def matches(self, event: Event) -> bool:
         if not self.active or event.type != self.type or event.value != self.value:
@@ -168,6 +174,150 @@ class KeyConfig:
         for name, entry in (data or {}).items():
             km = self.keymap(name, entry.get("space", ""))
             km.items = [KeyMapItem.from_dict(i) for i in entry.get("items", [])]
+
+
+# ====================================================================== 改键
+#: 一条键位里用户能改的部分
+KEY_FIELDS = ("type", "value", "ctrl", "shift", "alt", "any_mod", "active")
+#: 键位表的中文名（偏好设置里分组显示用）
+KEYMAP_TITLES = {
+    "Window": "全局", "Screen": "窗口布局", "3D View": "3D 视口", "Object Mode": "物体模式",
+    "Object Non-modal": "物体模式（通用）", "Mesh": "编辑模式", "Paint": "绘制", "Sculpt": "雕刻",
+    "Image": "UV / 图像", "Shader Editor": "材质节点", "Node": "节点纹理", "Layers": "图层", "Outliner": "大纲",
+}
+_TOOL_TITLES = {
+    "Select Box": "框选", "Select Circle": "刷选", "Select Lasso": "套索选择", "Tweak": "点选拖动", "Cursor": "游标",
+    "Edit Mesh, Extrude Region": "挤出", "Edit Mesh, Inset Faces": "内插面", "Edit Mesh, Bevel": "倒角",
+    "Edit Mesh, Shrink/Fatten": "沿法线缩放", "Edit Mesh, Smooth": "平滑顶点", "Edit Mesh, Loop Cut": "环切",
+    "Edit Mesh, Knife": "切刀", "Move": "移动", "Rotate": "旋转", "Scale": "缩放", "Gradient": "渐变",
+    "Fill": "油漆桶", "Clone": "仿制图章", "Text": "文字", "Marquee Rect": "矩形选框", "Marquee Ellipse": "椭圆选框",
+    "Lasso": "套索", "Polygon Lasso": "多边形套索", "Quick Select": "快速选择", "Wand": "魔棒", "Shape": "形状",
+}
+#: 全局的键位表：别的表里同样的键会先起作用
+GLOBAL_KEYMAPS = ("Window", "Screen")
+
+
+def keymap_title(name: str) -> str:
+    if name in KEYMAP_TITLES:
+        return KEYMAP_TITLES[name]
+    for prefix, label in (("3D View Tool: ", "3D 视口工具："), ("Paint Tool: ", "绘制工具：")):
+        if name.startswith(prefix):
+            tool = name[len(prefix):]
+            return label + _TOOL_TITLES.get(tool, tool)
+    return name
+
+
+def key_state(item: KeyMapItem) -> tuple:
+    return tuple(getattr(item, name) for name in KEY_FIELDS)
+
+
+def snapshot_defaults(kc: "KeyConfig") -> int:
+    """给还没记出厂值的键位记下现在的样子（程序刚建好键位表、插件刚加了键位表时调用）。返回记了几条。"""
+    count = 0
+    for km in kc.keymaps.values():
+        for item in km.items:
+            if item.default is None:
+                item.default = key_state(item)
+                count += 1
+    return count
+
+
+def _identity(name: str, item: KeyMapItem, default: tuple | None = None) -> tuple:
+    """认一条出厂键位：键位表、操作、参数、出厂的键。默认键位以后增删、换顺序也认得出来。"""
+    props = json.dumps(item.props, sort_keys=True, ensure_ascii=False, default=str)
+    return name, item.op, props, tuple(default if default is not None else item.default)
+
+
+def is_modified(item: KeyMapItem) -> bool:
+    return item.default is not None and key_state(item) != tuple(item.default)
+
+
+def overrides_from(kc: "KeyConfig") -> dict:
+    """和出厂键位不一样的那些，存进偏好设置（keymap_overrides）。"""
+    changes = []
+    for name, km in kc.keymaps.items():
+        seen: Counter = Counter()
+        for item in km.items:
+            if item.default is None:
+                continue
+            ident = _identity(name, item)
+            occurrence = seen[ident]
+            seen[ident] += 1
+            if is_modified(item):
+                changes.append({"keymap": name, "op": item.op, "props": dict(item.props),
+                                "default": dict(zip(KEY_FIELDS, item.default)), "occurrence": occurrence,
+                                "set": dict(zip(KEY_FIELDS, key_state(item)))})
+    return {"version": 1, "changes": changes}
+
+
+def apply_overrides(kc: "KeyConfig", data: Any) -> tuple[int, int]:
+    """把存下的改动用到键位表上（可以重复调用）。返回 (用上的, 找不到出厂键位的)。"""
+    if isinstance(data, str):
+        try:
+            data = json.loads(data or "{}")
+        except ValueError:
+            log.warning("键位改动读不出来，按出厂键位")
+            return 0, 0
+    snapshot_defaults(kc)
+    changes = (data or {}).get("changes", []) if isinstance(data, dict) else []
+    index: dict[tuple, list[KeyMapItem]] = {}
+    for name, km in kc.keymaps.items():
+        for item in km.items:
+            index.setdefault(_identity(name, item), []).append(item)
+    applied = missing = 0
+    for change in changes:
+        try:
+            default = tuple(change["default"][name] for name in KEY_FIELDS)
+            probe = KeyMapItem(change["op"], default[0], props=dict(change.get("props") or {}))
+            items = index.get(_identity(change["keymap"], probe, default), [])
+            occurrence = int(change.get("occurrence", 0))
+            if occurrence >= len(items):
+                missing += 1
+                continue
+            item = items[occurrence]
+            for name in KEY_FIELDS:
+                if name in change["set"]:
+                    setattr(item, name, change["set"][name])
+            applied += 1
+        except (KeyError, TypeError, ValueError):
+            missing += 1
+    if missing:
+        log.info("有 %d 条键位改动对应的出厂键位已经不在了，没有用上", missing)
+    return applied, missing
+
+
+def reset_item(item: KeyMapItem) -> None:
+    if item.default is not None:
+        for name, value in zip(KEY_FIELDS, item.default):
+            setattr(item, name, value)
+
+
+def reset_all(kc: "KeyConfig") -> None:
+    for km in kc.keymaps.values():
+        for item in km.items:
+            reset_item(item)
+
+
+def _same_keys(a: KeyMapItem, b: KeyMapItem) -> bool:
+    if a.type != b.type or a.value != b.value:
+        return False
+    return a.any_mod or b.any_mod or (a.ctrl, a.shift, a.alt) == (b.ctrl, b.shift, b.alt)
+
+
+def conflicts(kc: "KeyConfig", name: str, item: KeyMapItem) -> list[tuple[str, KeyMapItem]]:
+    """和这条键位用同一个键、会互相挡住的其他键位：同一张表里的；全局表和各编辑器表之间的。"""
+    if not item.active or not item.type:
+        return []
+    found = []
+    for other_name, km in kc.keymaps.items():
+        if other_name != name and name not in GLOBAL_KEYMAPS and other_name not in GLOBAL_KEYMAPS:
+            continue
+        for other in km.items:
+            if other is item or not other.active:
+                continue
+            if _same_keys(item, other) and not (other.op == item.op and other.props == item.props):
+                found.append((other_name, other))
+    return found
 
 
 KEY_LABELS = {

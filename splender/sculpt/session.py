@@ -147,6 +147,8 @@ class SculptStroke:
 class SculptSession:
     def __init__(self, engine, obj) -> None:
         started = time.perf_counter()
+        self.version = 0
+        self._changed = False
         self.engine = engine
         self.obj = obj
         self.ctx = engine.ctx
@@ -448,7 +450,48 @@ class SculptSession:
         self.set_mesh(result, "体素重构")
         return dict(result.stats, triangles=result.triangle_count, vertices=result.vertex_count)
 
+
+    # 「有没有没写回物体的改动」；每次标成 True 都换一个新版本号（自动保存据此判断形状变没变）
+    @property
+    def changed(self) -> bool:
+        return self._changed
+
+    @changed.setter
+    def changed(self, value: bool) -> None:
+        self._changed = bool(value)
+        if value:
+            self.version += 1
+
     # ------------------------------------------------------------------ 写回与退出
+    def save_snapshot(self):
+        """存盘用的当前形状，不写回物体、不重建显示（自动保存用，不打断雕刻）。
+
+        显卡读回在这里做；拆成每个角的数据交给返回的函数（不碰显卡，可以在别的线程里跑），它返回 MeshData。"""
+        from ..doc.meshio import MeshData
+
+        positions, normals, _mask = self.sculptor.read_vertices()
+        base = self.base
+        source = self.obj.data
+        retopo = bool(self.topology_version)
+        name = getattr(source, "name", "")
+        materials = list(getattr(source, "materials", []))
+        sizes = None if retopo else getattr(source, "polygon_sizes", None)
+        loose = getattr(source, "loose_edges", None)
+
+        def build():
+            mesh = SculptMesh(positions, base.triangles, base.corner_uvs, base.material_ids)
+            corner_pos, corner_nrm, corner_uv, mats = unweld(mesh, normals)
+            data = MeshData(name=name, positions=corner_pos, normals=corner_nrm, uvs=corner_uv, material_ids=mats,
+                            materials=materials,
+                            bounds_min=corner_pos.min(axis=0) if len(corner_pos) else np.zeros(3, np.float32),
+                            bounds_max=corner_pos.max(axis=0) if len(corner_pos) else np.zeros(3, np.float32))
+            data.has_uvs = base.corner_uvs is not None
+            data.polygon_sizes = sizes
+            data.loose_edges = loose
+            return data
+
+        return build
+
     def sync_to_object(self) -> bool:
         """把雕刻后的形状写回物体，绘制引擎重建几何。返回是否有改动。"""
         if not self.changed:

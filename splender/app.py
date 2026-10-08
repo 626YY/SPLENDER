@@ -37,6 +37,7 @@ class Application:
         self.prefs_path = user_dir() / "preferences.json"
         self.prefs.load(self.prefs_path)
         self.keyconfig = default_keyconfig()
+        self._apply_keymap_overrides()
         self.history = History(int(self.prefs.memory.undo_steps), int(self.prefs.memory.undo_mb) << 20)
         self.tool_settings = ToolSettings()
         self.tool_settings.eraser.size = 60.0
@@ -54,6 +55,14 @@ class Application:
         self._watched: list = []
         self.palette = self._load_palette()
         self._bake_queue: list = []            # 等着烘焙模型贴图的纹理集
+        self.selftest = False                  # 自检模式：不弹恢复、出错提示这类要人回答的窗口
+        self.session = None                    # 会话锁（core.recovery.Session）
+        self.last_restored: str | None = None  # 最近一次从自动保存恢复出来的工程文件
+        self._autosave_due = 0.0               # 下一次自动保存的时间（time.monotonic）
+        self._autosave_wait_start: float | None = None
+        self._autosave_failed = False
+        self._error_messages: set[str] = set()
+        self.wintab = None                     # WinTab 数位板接口（ui.wintab.WinTab），偏好里选了才开
 
     # ------------------------------------------------------------------ 便捷访问
     @property
@@ -124,6 +133,215 @@ class Application:
         from .core import addons
 
         addons.startup(self.prefs)
+        self._apply_keymap_overrides()                 # 插件加的键位表也用上改过的键位
+        self._start_session()
+        applog.on_unhandled = self._on_unhandled_error
+        if self.host is not None:
+            self.engine.autosave.on_finished.append(self._on_autosave_finished)
+        self._autosave_timer = QTimer()
+        self._autosave_timer.setInterval(1000)
+        self._autosave_timer.timeout.connect(self._autosave_tick)
+        self._autosave_timer.start()
+        self._schedule_autosave()
+        self._update_tablet()
+        try:
+            qt.applicationStateChanged.connect(self._on_app_state)
+        except Exception:  # noqa: BLE001
+            pass
+
+    # ---- 数位板 ----
+    def _update_tablet(self) -> None:
+        """按偏好设置开、关 WinTab（改了立即生效）。"""
+        mode = getattr(self.prefs.paint, "tablet_api", "AUTO")
+        # 自检时不开：新开的 WinTab 上下文会排到最前面，可能抢走正在别的软件里画画的人的笔
+        if mode == "WININK" or sys.platform != "win32" or self.window is None or self.selftest:
+            if self.wintab is not None:
+                self.wintab.close()
+                self.wintab = None
+            return
+        if self.wintab is not None and self.wintab.ok:
+            return
+        from .ui.wintab import WinTab
+
+        tablet = WinTab()
+        if tablet.open(int(self.window.winId())):
+            self.wintab = tablet
+        else:
+            self.wintab = None
+            log.info("WinTab 没开：%s", tablet.reason)
+            if mode == "WINTAB":
+                self.report("WinTab 没开：%s" % tablet.reason, "WARNING")
+
+    def tablet_mode(self) -> str:
+        return str(getattr(self.prefs.paint, "tablet_api", "AUTO"))
+
+    def _on_app_state(self, state) -> None:
+        from PySide6.QtCore import Qt
+
+        if state == Qt.ApplicationActive and self.wintab is not None:
+            self.wintab.to_front()
+
+    # ---- 改键 ----
+    def _apply_keymap_overrides(self) -> None:
+        from .core.keymap import apply_overrides
+
+        try:
+            apply_overrides(self.keyconfig, self.prefs.keymap_overrides)
+        except Exception:  # noqa: BLE001
+            log.exception("用上改过的键位时出错，按出厂键位")
+
+    def save_keymap_overrides(self) -> None:
+        """键位改过了：把和出厂不一样的那些存进偏好设置（随偏好设置一起写盘），菜单上的快捷键文字跟着变。"""
+        from .core.keymap import overrides_from
+
+        self.prefs.keymap_overrides = json.dumps(overrides_from(self.keyconfig), ensure_ascii=False)
+        self.notify("keymap")
+
+    # ---- 会话锁、自动保存、崩溃恢复 ----
+    def _start_session(self) -> None:
+        from .core.recovery import Session
+        from .paths import autosave_dir, log_dir
+
+        try:
+            self.session = Session(autosave_dir(self.prefs.files.autosave_dir), log_dir())
+            self.session.create()
+            if self.session.crash_path is not None:
+                applog.enable_crash_file(self.session.crash_path)
+        except Exception:  # noqa: BLE001
+            log.exception("建立会话锁失败，自动保存放进临时目录")
+            self.session = None
+
+    def _schedule_autosave(self) -> None:
+        self._autosave_due = time.monotonic() + max(0.25, float(self.prefs.files.autosave_minutes)) * 60.0
+        self._autosave_wait_start = None
+
+    def _autosave_busy(self) -> bool:
+        engine = self.engine
+        if engine is None:
+            return True
+        if engine.stroke is not None or engine.merges:
+            return True
+        sculpt = engine.sculpt
+        if sculpt is not None and sculpt.stroke is not None:
+            return True
+        return self.wm is not None and self.wm.has_modal()
+
+    def _autosave_tick(self) -> None:
+        """每秒看一眼：到时间了、你停手了（或推迟太久了）、没有笔划在进行，就开始一次自动保存。"""
+        files = self.prefs.files
+        engine = self.engine
+        if engine is None or not files.autosave or engine.autosave.active:
+            return
+        now = time.monotonic()
+        if now < self._autosave_due:
+            return
+        if self._autosave_wait_start is None:
+            self._autosave_wait_start = now
+        if self._autosave_busy():
+            return
+        idle = time.perf_counter() - getattr(self.wm, "last_input", 0.0)
+        if idle < float(files.autosave_idle) and now - self._autosave_wait_start < float(files.autosave_max_wait):
+            return
+        self._schedule_autosave()
+        self.autosave_now()
+
+    def autosave_now(self, wait: bool = False) -> bool:
+        """马上开始一次自动保存（没有要存的就不开始）。wait 为真时一直推进到做完。返回是否开始了。"""
+        engine = self.engine
+        if engine is None:
+            return False
+        from . import __version__
+
+        files = self.prefs.files
+        saver = engine.autosave
+        if self.session is not None:
+            saver.new_path = self.session.new_recovery_path
+        saver.level = 3
+        saver.threads = int(files.autosave_threads)
+        extra = {"ui": self._ui_state()} if files.save_layout_in_project else {}
+        info = {"session": self.session.id if self.session is not None else "", "app": __version__}
+        self.host.make_current()
+        try:
+            started = saver.start(self.project, extra=extra, info=info)
+        except Exception as error:  # noqa: BLE001
+            log.exception("自动保存没能开始")
+            self._on_autosave_finished({"error": str(error)})
+            return False
+        if started:
+            self.request_frame()
+            if wait:
+                saver.wait()
+        return started
+
+    def _on_autosave_finished(self, result: dict) -> None:
+        error = result.get("error")
+        if error:
+            if not self._autosave_failed:
+                self.report("自动保存失败：%s（到时间会再试）" % error, "WARNING")
+            self._autosave_failed = True
+            return
+        if self._autosave_failed:
+            self.report("自动保存恢复正常")
+        self._autosave_failed = False
+
+    def autosave_scan(self) -> tuple[list, list]:
+        """找可以恢复的自动保存：(列表, 刚发现的没正常退出的会话)。"""
+        from .core.recovery import scan
+        from .paths import autosave_dir
+
+        files = self.prefs.files
+        return scan(autosave_dir(files.autosave_dir), self.session, int(files.autosave_keep))
+
+    def restore_autosave(self, path: str) -> str:
+        """把一份自动保存还原成工程文件并打开，返回新工程文件的路径。"""
+        from .core.recovery import read_recoverable, remove_quiet, restore_target
+        from .engine.autosave import restore
+
+        item = read_recoverable(path)
+        if item is None:
+            raise RuntimeError("这份自动保存没有写完，不能恢复")
+        target = restore_target(item, self.prefs.files.restore_dir or None)
+        info = restore(path, target)
+        self.open_project(target)
+        self.last_restored = target
+        remove_quiet(path)
+        for warning in info["warnings"]:
+            self.report(warning, "WARNING")
+        self.report("已恢复到 %s" % target)
+        return target
+
+    def check_recovery_on_start(self) -> None:
+        """启动后：上次没正常退出、留下了自动保存，就问要不要恢复；只有崩溃报告时在状态栏提一句。"""
+        try:
+            items, ended = self.autosave_scan()
+        except Exception:  # noqa: BLE001
+            log.exception("查找自动保存时出错")
+            return
+        crashes = [item["crash"] for item in ended if item.get("crash")]
+        if crashes:
+            log.warning("上次程序崩溃了，崩溃报告：%s", "、".join(crashes))
+        if items and not self.selftest:
+            from .ui.recovery_dialog import RecoveryDialog
+
+            RecoveryDialog(self, items, startup=True).exec()
+        elif crashes:
+            self.report("上次程序意外退出了，崩溃报告在日志文件夹里（帮助 → 打开日志文件夹）", "WARNING")
+        elif ended:
+            self.report("上次程序没有正常退出", "WARNING")
+
+    def _on_unhandled_error(self, kind, value, tb) -> None:
+        text = str(value) or kind.__name__
+        if self.wm is not None:
+            self.wm.report("出错了：%s（详细信息在日志里）" % text, "ERROR")
+        if self.selftest or not self.prefs.interface.error_dialog:
+            return
+        window = self.window
+        if window is None or not window.isVisible() or text in self._error_messages or len(self._error_messages) >= 3:
+            return
+        self._error_messages.add(text)
+        from .ui.recovery_dialog import show_error
+
+        show_error(self, kind, value, tb)
 
     # ---- 选区 ----
     def _on_selection_changed(self, ts) -> None:
@@ -208,6 +426,8 @@ class Application:
             self.history.set_limits(int(self.prefs.memory.undo_steps), int(self.prefs.memory.undo_mb) << 20)
         if name.startswith("navigation") or name.startswith("viewport"):
             self.request_frame()
+        if name == "paint.tablet_api":
+            self._update_tablet()
         if name.startswith("viewport.selection"):
             if self.engine is not None:
                 for view in self.engine.views:
@@ -442,7 +662,10 @@ class Application:
         engine = self.engine
         if engine is None or self.project is None:
             return
-        for set_uid in obj.material_sets:
+        affected = list(obj.material_sets)
+        # 拿这个模型当高模的纹理集也要重烘
+        affected += [ts.uid for ts in self.project.texture_sets if str(ts.meshmap.high_poly_object) == str(obj.uid)]
+        for set_uid in dict.fromkeys(affected):
             ts = self.project.texture_set(set_uid)
             if ts is None or engine.meshmap(set_uid) is None or not ts.meshmap.auto_rebake:
                 continue
@@ -558,6 +781,40 @@ class Application:
                                                    time.perf_counter() - started))
         return project
 
+    def import_into_scene(self, path: str):
+        """把模型文件里的模型加进当前场景：每个材质一套新贴图，记一步撤销。返回新模型。"""
+        from .doc.meshio import load_mesh
+        from .ops.object_ops import add_objects_with_undo, new_texture_set, unique_name
+
+        started = time.perf_counter()
+        mesh = load_mesh(path)
+        project = self.project
+        name = unique_name(project, os.path.splitext(os.path.basename(path))[0] or "模型")
+        mesh.name = name
+        taken = {ts.name for ts in project.texture_sets}
+        sets = []
+        for index, material in enumerate(list(mesh.materials) or ["材质"]):
+            label = material or "%s 材质 %d" % (name, index + 1)
+            unique = label
+            number = 2
+            while unique in taken:
+                unique = "%s %d" % (label, number)
+                number += 1
+            taken.add(unique)
+            sets.append(new_texture_set(self, unique))
+        obj = MeshObject(name, mesh, [ts.uid for ts in sets])
+        obj.geometry_dirty = True
+        self.host.make_current()
+        add_objects_with_undo(self.wm.context(use_mouse=False), [obj], sets, "导入 %s" % os.path.basename(path))
+        self.prefs.files.last_dir = os.path.dirname(path)
+        for warning in getattr(mesh, "warnings", []) or []:
+            self.report(str(warning), "WARNING")
+        if not getattr(mesh, "has_uvs", True):
+            self.report("「%s」没有 UV，画之前先展开（UV → 智能投射）" % name, "WARNING")
+        self.report("已导入到场景：%s，%s 个三角形，用时 %.1f 秒" % (name, format(mesh.triangle_count, ","),
+                                                       time.perf_counter() - started))
+        return obj
+
     def open_project(self, path: str) -> Project:
         self.history.clear()
         self.host.make_current()
@@ -592,6 +849,7 @@ class Application:
         self.host.make_current()
         written = []
         used: set[str] = set()
+        files: dict[int, dict] = {}
         for ts in self.project.texture_sets:
             settings = ts.export
             chosen = channels or [c for c in EXPORT_IDS if getattr(settings, c)]
@@ -606,9 +864,132 @@ class Application:
                 self.qt.processEvents()
                 self.engine.export_channel(ts, channel, target, size=set_size)
                 written.append(target)
+                files.setdefault(ts.uid, {})[channel] = name
         self.wm.set_progress("", None)
         self.report("已导出 %d 张贴图到 %s" % (len(written), folder))
+        # 勾了「连模型一起导出」的纹理集：用到它们的模型按各自选的格式导出到同一个文件夹
+        by_format: dict[str, set] = {}
+        for ts in self.project.texture_sets:
+            if ts.export.with_mesh:
+                by_format.setdefault(ts.export.mesh_format, set()).add(ts.uid)
+        for fmt, uids in by_format.items():
+            objects = [obj for obj in self.project.objects if obj.visible and uids & set(obj.material_sets)]
+            if not objects:
+                continue
+            target = os.path.join(folder, export_file_name("{工程}", self.project.name, "", "")[:-4]
+                                  + (".glb" if fmt == "GLB" else ".obj"))
+            info = self.export_meshes(target, objects, with_textures=True, size=size, texture_files=files)
+            written.append(info["path"])
         return written
+
+    def _export_mesh_data(self, obj):
+        """导出用的模型数据：雕刻中的先写回物体，编辑模式里的用完整网格（含隐藏的面）。"""
+        engine = self.engine
+        sculpt = getattr(engine, "sculpt", None) if engine is not None else None
+        if sculpt is not None and sculpt.obj is obj:
+            sculpt.sync_to_object()
+        edit = getattr(engine, "edit", None) if engine is not None else None
+        if edit is not None and edit.obj is obj and edit.changed:
+            return edit.full_data()
+        return obj.data
+
+    def export_meshes(self, path: str, objects: list | None = None, *, with_textures: bool = True,
+                      size: int | None = None, scale: float = 1.0, texture_files: dict | None = None) -> dict:
+        """把模型导出成 .glb 或 .obj（按扩展名）。objects 默认是全部可见的模型。
+
+        with_textures：glb 把基础色、法线、遮蔽粗糙度金属度打包贴图装进文件；obj 在旁边写 PNG，材质文件引用它们。
+        texture_files：{纹理集 uid: {通道: 文件名}}，obj 直接引用这些已经导出的贴图（不再另外导出）。"""
+        import shutil
+        import tempfile
+
+        from .doc.meshexport import export_glb, export_obj
+        from .engine.projectio import export_file_name
+
+        fmt = os.path.splitext(path)[1].lower()
+        if fmt not in (".glb", ".obj"):
+            raise ValueError("只支持 .glb 和 .obj：%s" % path)
+        project = self.project
+        if objects is None:
+            objects = [obj for obj in project.objects if obj.visible]
+        if not objects:
+            raise ValueError("没有可以导出的模型")
+        self.host.make_current()
+        engine = self.engine
+        engine.complete_strokes(include_active=True)
+        sets = {ts.uid: ts for ts in project.texture_sets}
+        labels: dict[int, str] = {}
+        used: set[str] = set()
+        for obj in objects:
+            for uid in obj.material_sets:
+                if uid in labels or uid not in sets:
+                    continue
+                label = sets[uid].name or "材质"
+                number = 2
+                while label.lower() in used:
+                    label = "%s %d" % (sets[uid].name, number)
+                    number += 1
+                used.add(label.lower())
+                labels[uid] = label
+        items = []
+        for obj in objects:
+            data = self._export_mesh_data(obj)
+            names = [labels.get(uid, "材质") for uid in obj.material_sets] or ["材质"]
+            items.append((obj.name, data, names))
+        folder = os.path.dirname(os.path.abspath(path))
+        info: dict = {}
+        if fmt == ".glb":
+            materials = {}
+            temp = tempfile.mkdtemp(prefix="splender_glb_") if with_textures else None
+            try:
+                for uid, label in labels.items():
+                    ts = sets[uid]
+                    entry = {"color": tuple(ts.base_color), "metallic": float(ts.base_metallic),
+                             "roughness": float(ts.base_roughness)}
+                    if temp is not None and uid in engine.sets:
+                        set_size = size or int(ts.export.size) or None
+                        for channel, source in (("basecolor", "basecolor"), ("orm", "orm"), ("normal", "normal_gl")):
+                            self.wm.set_progress("正在准备「%s」的%s贴图" % (label, {"basecolor": "基础色", "orm": "遮蔽粗糙度金属度",
+                                                                              "normal": "法线"}[channel]), 0.0)
+                            self.qt.processEvents()
+                            target = os.path.join(temp, "%d_%s.png" % (uid, channel))
+                            engine.export_channel(ts, source, target, size=set_size)
+                            with open(target, "rb") as handle:
+                                entry[channel] = handle.read()
+                    materials[label] = entry
+                self.wm.set_progress("正在写 %s" % os.path.basename(path), 0.9)
+                self.qt.processEvents()
+                info = export_glb(path, items, materials=materials, scale=scale)
+            finally:
+                if temp is not None:
+                    shutil.rmtree(temp, ignore_errors=True)
+        else:
+            textures = {}
+            if with_textures:
+                for uid, label in labels.items():
+                    ts = sets[uid]
+                    given = (texture_files or {}).get(uid)
+                    if given is not None:
+                        textures[label] = dict(given)
+                        continue
+                    if uid not in engine.sets:
+                        continue
+                    files = {}
+                    set_size = size or int(ts.export.size) or None
+                    for channel in ("basecolor", "metallic", "roughness", "normal"):
+                        name = export_file_name(ts.export.name_pattern, project.name, label, channel)
+                        self.wm.set_progress("正在导出 %s" % name, 0.0)
+                        self.qt.processEvents()
+                        engine.export_channel(ts, channel, os.path.join(folder, name), size=set_size)
+                        files[channel] = name
+                    textures[label] = files
+            self.wm.set_progress("正在写 %s" % os.path.basename(path), 0.9)
+            self.qt.processEvents()
+            info = export_obj(path, items, textures=textures, scale=scale)
+        self.wm.set_progress("", None)
+        self.prefs.files.export_dir = folder
+        self.report("已导出模型 %s：%s 个三角形，用时 %.1f 秒" % (os.path.basename(path), format(info.get("triangles", 0), ","),
+                                                     float(info.get("seconds", 0.0))))
+        return info
 
     def _ui_state(self) -> dict:
         try:
@@ -658,12 +1039,26 @@ class Application:
         except Exception:  # noqa: BLE001
             log.exception("停用插件时出错")
         self.save_prefs()
+        timer = getattr(self, "_autosave_timer", None)
+        if timer is not None:
+            timer.stop()
         if self.wm is not None:
             self.wm.shutdown()
         if self.host is not None:
             self.host.make_current()
+            try:
+                self.engine.autosave.shutdown(delete=True)     # 正常退出：恢复文件用不着了
+            except Exception:  # noqa: BLE001
+                log.exception("关闭自动保存时出错")
             self.engine.close_storage()
             self.host.shutdown()
+        if self.wintab is not None:
+            self.wintab.close()
+            self.wintab = None
+        applog.on_unhandled = None
+        if self.session is not None:
+            self.session.close()
+        applog.disable_crash_file(delete_if_empty=True)
 
 
 def _set_app_id() -> None:
@@ -685,12 +1080,53 @@ def create_qt(argv: list[str], vsync: bool = True):
     qt.setApplicationName(APP_NAME)
     qt.setApplicationDisplayName(APP_NAME)
     qt.setApplicationVersion(__version__)
+    _install_qt_chinese(qt)
     return qt
+
+
+def _install_qt_chinese(qt) -> None:
+    """Qt 自带的窗口（消息框的「显示详细信息」、文件对话框等）用中文。"""
+    from PySide6.QtCore import QLibraryInfo, QTranslator
+
+    if getattr(qt, "_splender_translator", None) is not None:
+        return
+    folders = [QLibraryInfo.path(QLibraryInfo.TranslationsPath)]
+    try:
+        import PySide6
+
+        folders.append(os.path.join(os.path.dirname(PySide6.__file__), "translations"))
+    except Exception:  # noqa: BLE001
+        pass
+    translator = QTranslator(qt)
+    for folder in folders:
+        if folder and translator.load("qtbase_zh_CN", folder):
+            qt.installTranslator(translator)
+            qt._splender_translator = translator
+            return
+    log.info("没找到 Qt 自带窗口的中文翻译，按钮等会显示英文")
+
+
+def _warm_up_numba() -> None:
+    """后台先把显示模型要用的 numba 函数编译好（有缓存时只是读进来），和建界面、建显卡上下文同时进行。
+    第一次启动（还没有编译缓存）能少等几秒；主线程用到时如果还在编，会等编译锁，不会重复编。"""
+    import threading
+
+    def work() -> None:
+        try:
+            from .doc.meshio import make_test_mesh
+            from .engine.meshprep import build_set_geometry
+
+            build_set_geometry(make_test_mesh("sphere", segments=8, rings=4), 0, 256, skirt_texels=2.0)
+        except Exception:  # noqa: BLE001
+            log.debug("预先编译没做完", exc_info=True)
+
+    threading.Thread(target=work, name="splender-warmup", daemon=True).start()
 
 
 def run(argv: list[str]) -> int:
     applog.setup()
     ensure_vendor_path()
+    _warm_up_numba()
     _set_app_id()
     selftest = None
     if "--selftest" in argv:
@@ -699,6 +1135,7 @@ def run(argv: list[str]) -> int:
         del argv[index:index + 2]
     project_path = next((a for a in argv if not a.startswith("-") and a.lower().endswith(".splender")), None)
     app = Application()
+    app.selftest = selftest is not None
     qt = create_qt(argv, vsync=bool(app.prefs.viewport.vsync))
     splash = None
     if selftest is None and app.prefs.interface.show_splash:
@@ -733,6 +1170,10 @@ def run(argv: list[str]) -> int:
         app.report("没有打开：%s" % error, "ERROR")
     if splash is not None:
         splash.finish(window)
+    if selftest is None:
+        from PySide6.QtCore import QTimer
+
+        QTimer.singleShot(400, app.check_recovery_on_start)
     if selftest is not None:
         from .selftest import run_script
 

@@ -525,3 +525,84 @@ Intel Open Image Denoise 2.5（`pyoidn`，放在 `runtime/site-packages`）。�
 - 选区改了只重画视口（`selection_changed`）；界面在操作做完时刷新一次。
 - 蒙版缺页的格按初始值：生成上面各级（`PageOps.downsample` 的 `empty`）时也按它，以前填 0，白蒙版拉远看会发黑。
 
+## 26. 自动保存与崩溃恢复 `engine/autosave.py`、`core/recovery.py`、`ui/recovery_dialog.py`
+
+- 恢复文件和工程文件同格式（`ProjectFile`），放在自动保存目录（默认用户设置目录的 autosave），文件名带会话名
+  （`<会话>-<序号>.splender-recover`）。工程有文件时只写相对它改过的：页（`page.dirty` 或 `disk_key` 对不上）、
+  改过的模型（`MeshObject.geometry_version`；雕刻中用 `SculptSession.save_snapshot` 读回、不写回物体；编辑中用 `full_data`）、
+  没存过的模型贴图（`MeshMapSet.serial`），外加工程信息和「工程文件里哪些页、哪些模型贴图已经不要了」。没存过的工程整份写。
+- 增量：页一旦写好不再原地改（改动产生新页），所以页上记 `asave = (恢复文件标记, 键, 写入编号)`，和 `rec_keys[键]` 对上就没变。
+  撤销回到和工程文件一样的页：这一格从恢复文件删掉。存盘、换工程（`Engine.save_project` / `set_project`）后恢复文件作废、删掉。
+- 取数据在主线程按帧分摊（`pump`，每帧预算 `files.autosave_budget_ms`）：有内存副本、暂存文件、工程文件副本的直接取，
+  只在显存的请缓存 `request_backup` 异步读回再取；正在画笔划（或雕刻笔划）时不取，写盘线程也停在手上那一批后面（`gate`）。
+  写盘线程（调低一档优先级）解 LZ4、交给 `ProjectFile` 压缩写入；一次自动保存是一个事务，崩溃时停在上一次完整的状态。
+- 恢复文件用回滚日志（`journal="TRUNCATE"`）：一次写几 GB 的大事务比 WAL 快五倍左右，也不会临时多占一倍磁盘；
+  读它的地方也要用同样的模式打开（混着开会报磁盘错误）。
+- 计时（app）：每秒看一眼，到了间隔、停手够久（或推迟超过上限）、没有笔划/合并/模态操作就开始。
+- 会话锁 `<会话>.lock`（进程号、进程启动时间）：正常退出删锁和自己的恢复文件。启动时（`check_recovery_on_start`）锁的进程不在了
+  （按进程号和启动时间，防进程号被重用）= 上次没正常退出：列出它留下的恢复文件；没写完过一次的删掉；超过份数删最早的。
+- 恢复（`restore`）：原工程关一次（日志并回主文件）后按普通文件复制，再盖上恢复文件里的页（原样复制，不重新压缩）、资源、
+  工程信息，删掉记成不要了的页和模型贴图；没存过的工程直接复制恢复文件、去掉恢复记录。结果是一个新的工程文件，打开它。
+- 崩溃报告：faulthandler 写日志文件夹里的 `crash-<会话>.txt`，正常退出时空文件删掉。没被接住的异常记日志后交给
+  `log.on_unhandled`：状态栏提示，偏好设置开着时弹窗（同一条最多一次，一次运行最多三条），能复制诊断信息（`core/diagnostics.py`）。
+- 页面缓存的帧号只往前走（`PageCache.begin`），引擎帧号每帧和它对齐：同步的大操作（整层滤镜、导出）会自己往前推帧，
+  以前之后引擎给的帧号倒回去，那段时间用过的页一直算「刚用过」换不出去，下一个大操作就把页池挤满。
+
+## 27. 导出模型 `doc/meshexport.py`、`app.export_meshes`、`ops/file_ops.py`
+
+- 坐标：内部就是 Y 朝上（和 glTF、OBJ 一样），顶点已经是变换后的世界坐标，原样写出。材质名用纹理集的名字（重名补编号）。
+- 模型数据：雕刻中的先 `sync_to_object`，编辑模式里有改动的用 `full_data()`（含隐藏的面）。
+- glb：每个材质一个图元，位置/法线/UV 打包后去重；UV 的 V 翻过来（glTF 原点在左上）。贴图按纹理集导出到临时文件再装进去：
+  基础色、ORM（`export_channel` 的 `orm` 通道：合成时一次取 R 遮蔽、G 粗糙度、B 金属度）、法线（`normal_gl`：不管纹理集设置，
+  一律 OpenGL 绿色朝上）。
+- obj：保留四边形（`polygon_sizes`）、按材质分组；贴图写在旁边（命名规则同导出贴图），.mtl 用 map_Kd、map_Pr、map_Pm、norm。
+  导出贴图勾了「连模型一起导出」时直接引用刚写的贴图，不重复导出。
+
+## 28. 场景里的高模、导入到当前场景
+
+- `MeshMapSettings.high_poly_object`：场景里模型的编号（字符串，"0" 表示不用），选项按当前工程的模型现列。
+  选了它就不用 `high_poly` 文件。`BakeJob` 开始时在主线程取它这一刻的形状（雕刻中先写回、编辑中用 `full_data`，再浅拷贝），
+  准备线程里当高模用（法线、曲率、唯一的遮挡体）；它自己不当烘焙目标（复制出来的高模和低模共用纹理集也没关系），藏起来也照样用。
+  `meta["high_poly"]` 记成「场景：名字」（`has_normal` 靠它）。雕刻过的模型如果是别的纹理集的高模，那些纹理集也按「形状改了自动重烘」重烘。
+- `app.import_into_scene`：读模型文件，每个材质一套新纹理集（新物体的分辨率，重名补编号），`add_objects_with_undo` 记一步撤销。
+
+## 29. 8K/16K 模型贴图
+
+- `MeshMapSet` 里每张贴图有自己的大小：a（遮蔽、曲率、厚度）、t（切线法线）按分辨率；n（朝向）、p（位置）、i（部件）按
+  `smooth_resolution`（默认 4K）封顶。烘焙时收尾着色器按缩小倍数取每格中间那个写进小图（`u_shrink`）。合成取样时
+  小图用自己的多级（`u_map_lod_s`），部件按 `textureSize` 取格；滤镜按 UV 取位置，和大小无关。显存估算 `estimate_vram_mb`。
+- 扩边：按块（2048 + 两边各一个扩边半径）做跳跃泛洪，种子只认真正覆盖到的格（1.0），不认前面的块扩出来的格（0.75）；
+  整图的（a、t）和小图的（n、p、i）各做一遍。结果和按距离变换算的完全一致（`test_smooth_maps_and_tiled_padding`）。
+- 每帧只做一小步：先逐个编着色器（编过的留在 `engine.bake_programs`），再逐步准备显卡资源（`_setup_steps`），
+  从高模取细节按横条分批（`PROJECT` 阶段），收尾按块扩边、逐张生成多级。
+- 读回：`read_array(名字)` 一张一张读回并留着；缩略图读贴图合适的一级（`_preview_source`），选部件只读部件图；
+  自动保存遇到没读回的模型贴图，用 `readback_steps()` 按 16 MB 一条分帧读回，读完再交给写盘线程。
+
+## 30. 改键 `core/keymap.py`、`ui/keymap_editor.py`
+
+- 键位表在代码里建（`default_keyconfig`）。每条记下出厂时的 `KEY_FIELDS`（`snapshot_defaults`，插件后加的表在
+  `apply_overrides` 时补记）。存盘只存和出厂不一样的（`overrides_from` → `prefs.keymap_overrides`），每条按
+  「表名、操作、参数（排序后的 JSON）、出厂键、同样的第几条」认，出厂键位以后增删、换顺序也对得上；对不上的跳过并记日志。
+- 程序建好键位表后、插件加载完再各用一次（`_apply_keymap_overrides`，可以重复调用）。改了就 `save_keymap_overrides`，
+  随偏好设置写盘；查找、菜单上的快捷键文字都直接读这张表，所以立即生效。
+- 冲突（`conflicts`）：同一张表里同一个键（含 any_mod）；全局表（Window、Screen）和其他表之间。编辑器之间不算（不会同时生效）。
+- 键位页：树状列表按表分组；点快捷键那格进入录键，事件过滤器接下一个键（修饰键自己不算）、鼠标键、滚轮，Esc 取消；
+  录进来的键按能产生的方式改「按下方式」（键盘没有拖动、单击、双击，滚轮只有滚动）。
+
+## 31. 数位板接口 `ui/wintab.py`
+
+- Qt 6 在 Windows 上只有 Windows Ink（WM_POINTER）；驱动里关了 Windows Ink 时笔只是鼠标。`WinTab` 用 ctypes 调 wintab32.dll：
+  `WTInfoW` 取压感范围、倾斜范围和默认系统上下文，`WTOpenW` 在主窗口上开（CXO_SYSTEM，笔照常管光标；不要消息，自己 `WTPacketsGet`），
+  包按 PK_STATUS、TIME、CURSOR、BUTTONS、NORMAL_PRESSURE、ORIENTATION 从低位到高位排（`PACKET`，32 字节）。
+- `InputForwarder` 每个鼠标事件先 `poll()` 把队列取空，笔在板子上（没有 TPS_PROXIMITY）、包在 0.25 秒内的，`annotate` 补上
+  压感、倾斜（高度角、方位角换成和 Qt 同向的度数）、橡皮端（TPS_INVERT）。「WinTab」模式下 Qt 的数位板事件直接 ignore，
+  让它合成鼠标事件再补。程序激活时 `WTOverlap` 把上下文放到最前。自检时不开（新上下文会排到最前，会抢别的软件里正在画的笔）。
+
+## 32. 启动
+
+- `__main__.configure_numba_cache`：第一次 import numba 之前把 NUMBA_CACHE_DIR 设到用户设置目录的 numba-cache（默认存在源码旁边，
+  装在只读目录时存不进去，每次都重新编译）；自检的设置目录每次都是新的，缓存放源码目录的 .cache/numba。
+- `app._warm_up_numba`：一开始就在后台线程里对一个小球跑一遍 `build_set_geometry`（显示模型要用的 16 个 numba 函数），
+  和建界面、建显卡上下文同时做；主线程用到时还在编就等编译锁。缓存是空的时候启动画面说明「第一次启动」。
+- 跑分：tests_new/usage_startup.py 连着启动两次（空缓存、有缓存），量到「能用」和「画完第一笔」。
+

@@ -10,7 +10,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
 EVIDENCE = ROOT / "docs" / "evidence" / "selftest"
-NAMES = ["basic", "window", "objects", "edit", "gizmo", "shader", "render", "sculpt", "bake", "folders", "export", "parts", "uvpaint", "nodes", "adjust", "filters", "tools", "select"]
+NAMES = ["basic", "window", "objects", "edit", "gizmo", "shader", "render", "sculpt", "bake", "folders", "export", "parts", "uvpaint", "nodes", "adjust", "filters", "tools", "select", "autosave", "meshexport", "highpoly", "tablet"]
 
 
 def _print(text: str) -> None:
