@@ -1,0 +1,39 @@
+#pragma code_page(65001)
+// SPLENDER.exe 的资源：程序图标和版本信息。
+// 本文件按 UTF-8 保存。版本号由 build_launcher.py 从 splender/__init__.py 读出，
+// 写进构建目录里的 splender_version.h；图标来自 splender/resources/logo/splender.ico
+// （先运行 tools/make_logo.py 生成）。
+
+#include <winver.h>
+#include "splender_version.h"
+
+// 资源管理器取第一个图标组作为程序图标；Qt 窗口没设图标时也会用名为 IDI_ICON1 的图标。
+IDI_ICON1 ICON "splender.ico"
+
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION    SPLENDER_VER_MAJOR, SPLENDER_VER_MINOR, SPLENDER_VER_PATCH, SPLENDER_VER_BUILD
+ PRODUCTVERSION SPLENDER_VER_MAJOR, SPLENDER_VER_MINOR, SPLENDER_VER_PATCH, SPLENDER_VER_BUILD
+ FILEFLAGSMASK  VS_FFI_FILEFLAGSMASK
+ FILEFLAGS      0x0L
+ FILEOS         VOS_NT_WINDOWS32
+ FILETYPE       VFT_APP
+ FILESUBTYPE    VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        // 0804 = 简体中文，04b0 = Unicode
+        BLOCK "080404b0"
+        BEGIN
+            VALUE "FileDescription",  "SPLENDER 16K 贴图创作"
+            VALUE "FileVersion",      SPLENDER_VER_STRING
+            VALUE "InternalName",     "SPLENDER"
+            VALUE "OriginalFilename", "SPLENDER.exe"
+            VALUE "ProductName",      "SPLENDER"
+            VALUE "ProductVersion",   SPLENDER_VER_STRING
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0804, 1200
+    END
+END

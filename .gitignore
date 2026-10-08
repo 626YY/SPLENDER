@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+*.nbi
+*.nbc
+/runtime/
+/SPLENDER.exe
+/legacy/
+/output/
+/.devuser/
+/docs/evidence/
+*.splender
+*.log
+.splender-open-source
